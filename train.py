@@ -39,7 +39,7 @@ class PVTV2Encoder(torch.nn.Module, EncoderMixin):
         super().__init__()
 
         # Load PVTv2-B2 model
-        self.model = timm.create_model('pvt_v2_b2', pretrained=True, features_only=True)
+        self.model = timm.create_model('pvt_v2_b5', pretrained=True, features_only=True)
         
         # Get the output channels from the model
         channels = self.model.feature_info.channels()
@@ -69,47 +69,8 @@ class PVTV2Encoder(torch.nn.Module, EncoderMixin):
     def load_state_dict(self, state_dict, *args, **kwargs):
         self.model.load_state_dict(state_dict, *args, **kwargs)
 
-    def set_in_channels(self, in_channels, pretrained=True):
-        """Method for changing input channels in encoder."""
-        if in_channels == 3:
-            return
-            
-        if not pretrained:
-            self.model = timm.create_model(
-                'pvt_v2_b2',
-                pretrained=False,
-                features_only=True,
-                in_chans=in_channels
-            )
-            self._in_channels = in_channels
-            return
-            
-        # If pretrained and in_channels != 3, modify the first conv layer
-        layer = self.model.patch_embed.proj
-        new_layer = torch.nn.Conv2d(
-            in_channels,
-            layer.out_channels,
-            kernel_size=layer.kernel_size,
-            stride=layer.stride,
-            padding=layer.padding,
-            bias=layer.bias is not None
-        )
-        
-        # Copy weights from existing channels
-        if in_channels > 3:
-            new_layer.weight.data[:, :3, :, :] = layer.weight.data
-            if layer.bias is not None:
-                new_layer.bias.data = layer.bias.data
-        else:  # in_channels < 3
-            new_layer.weight.data = layer.weight.data[:, :in_channels, :, :]
-            if layer.bias is not None:
-                new_layer.bias.data = layer.bias.data
-                
-        self.model.patch_embed.proj = new_layer
-        self._in_channels = in_channels
-
 # Регистрируем энкодер в segmentation_models_pytorch
-smp.encoders.encoders["pvt_v2_b2"] = {
+smp.encoders.encoders["pvt_v2_b5"] = {
     "encoder": PVTV2Encoder,  # encoder class here
     "pretrained_settings": {
         "imagenet": {
@@ -123,12 +84,12 @@ smp.encoders.encoders["pvt_v2_b2"] = {
     }
 }
 
-# model = smp.FPN(
-#     encoder_name="pvt_v2_b2",
-#     encoder_weights=None,
-#     in_channels=3,
-#     classes=1
-# )
+model = smp.FPN(
+    encoder_name="pvt_v2_b5",
+    encoder_weights=None,
+    in_channels=3,
+    classes=1
+)
 
 # Tiny baseline model
 # model = smp.UnetPlusPlus(
@@ -147,13 +108,13 @@ smp.encoders.encoders["pvt_v2_b2"] = {
 #     # in_channels=3,
 # )
 
-model = smp.Segformer(
-    encoder_name="mit_b5", # mobilenet_v2
-    encoder_weights="imagenet",
-    # aux_params=aux_params,
-    in_channels=3,
-    classes=1,
-)
+# model = smp.Segformer(
+#     encoder_name="mit_b5", # mobilenet_v2
+#     encoder_weights="imagenet",
+#     # aux_params=aux_params,
+#     in_channels=3,
+#     classes=1,
+# )
 
 # Определяем устройство
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -703,7 +664,7 @@ def validate(model, loader, criterion, metrics, device, writer, epoch):
     
     return total_loss / len(loader), metric_values
 
-num_epochs = 50
+num_epochs = 100
 best_val_iou = 0.0  # Изменяем с loss на IoU
 patience = 10
 patience_counter = 0
