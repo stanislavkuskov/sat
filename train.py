@@ -16,13 +16,13 @@ from segmentation_models_pytorch.encoders._base import EncoderMixin
 from datetime import datetime
 import torch.nn.functional as F
 import matplotlib.patches as patches
+import random
 
 # Set random seed for reproducibility
 SEED = 42
 torch.manual_seed(SEED)
 torch.cuda.manual_seed_all(SEED)
 np.random.seed(SEED)
-import random
 random.seed(SEED)
 torch.backends.cudnn.deterministic = True
 torch.backends.cudnn.benchmark = False
@@ -267,27 +267,83 @@ class SatelliteDataset(Dataset):
 
 # ---- Boundary Loss ----
 def boundary_map(mask):
-    # mask: [B, 1, H, W] torch tensor, 0/1
-    mask_np = mask.cpu().numpy().astype(np.uint8)
+    """
+    Извлекает карту границ из бинарной маски.
+    mask: [B, 1, H, W] torch tensor, значения 0/1
+    returns: [B, 1, H, W] torch tensor, значения 0-1
+    """
+    # Переводим в numpy и расширяем диапазон до 0-255
+    mask_np = (mask.cpu().numpy() * 255).astype(np.uint8)
+    
     edge_maps = []
     for m in mask_np:
-        edge = cv2.Canny(m[0]*255, 50, 150)  # Canny expects 0-255 uint8
+        # Применяем размытие перед детектором границ для лучшего результата
+        blurred = cv2.GaussianBlur(m[0], (3, 3), 0)
+        # Используем более низкие пороги для Canny, так как у нас бинарная маска
+        edge = cv2.Canny(blurred, 30, 100)
+        # Нормализуем обратно к 0-1
         edge_maps.append(edge / 255.)
+    
     edge_maps = np.stack(edge_maps)
     return torch.from_numpy(edge_maps).float().unsqueeze(1).to(mask.device)
 
-def boundary_loss(pred, target):
-    pred_prob = torch.sigmoid(pred)
-    pred_edge = boundary_map((pred_prob > 0.5).float())
-    target_edge = boundary_map(target)
-    return F.binary_cross_entropy(pred_edge, target_edge)
-# ---- END Boundary Loss ----
+class ConditionalBoundaryLoss(torch.nn.Module):
+    def __init__(self, theta=3, window_size=3):
+        super().__init__()
+        self.theta = theta
+        self.window_size = window_size
+        self.pool = torch.nn.AvgPool2d(window_size, stride=1, padding=window_size//2)
+    
+    def forward(self, pred, target):
+        """
+        pred: Tensor of shape (N, 1, H, W) - выход модели (logits)
+        target: Tensor of shape (N, 1, H, W) - бинарные метки
+        """
+        # Получаем вероятности
+        pred_prob = torch.sigmoid(pred)
+        
+        # Получаем границы из целевой маски
+        target_edges = boundary_map(target)
+        
+        # Вычисляем локальную неопределенность
+        local_uncertainty = -pred_prob * torch.log(pred_prob + 1e-6) - \
+                          (1 - pred_prob) * torch.log(1 - pred_prob + 1e-6)
+        uncertainty_map = self.pool(local_uncertainty)
+        
+        # Вычисляем веса для каждого пикселя на основе неопределенности
+        weights = torch.exp(-uncertainty_map / self.theta)
+        
+        # Вычисляем градиенты предсказаний
+        grad_y = torch.abs(pred_prob[:, :, 1:, :] - pred_prob[:, :, :-1, :])
+        grad_x = torch.abs(pred_prob[:, :, :, 1:] - pred_prob[:, :, :, :-1])
+        
+        # Обрезаем веса и target_edges под размер градиентов
+        weights_y = weights[:, :, 1:, :]
+        weights_x = weights[:, :, :, 1:]
+        target_edges_y = target_edges[:, :, 1:, :]
+        target_edges_x = target_edges[:, :, :, 1:]
+        
+        # Вычисляем взвешенные потери отдельно для границ и не-границ
+        # Для границ: поощряем высокие градиенты
+        boundary_loss_y = (1 - grad_y) * target_edges_y * weights_y
+        boundary_loss_x = (1 - grad_x) * target_edges_x * weights_x
+        
+        # Для не-границ: штрафуем высокие градиенты
+        smoothness_loss_y = grad_y * (1 - target_edges_y) * weights_y
+        smoothness_loss_x = grad_x * (1 - target_edges_x) * weights_x
+        
+        # Комбинируем потери
+        total_loss = (boundary_loss_y.mean() + boundary_loss_x.mean() + 
+                     smoothness_loss_y.mean() + smoothness_loss_x.mean()) / 4.0
+        
+        return total_loss
 
 class ComboLoss(torch.nn.Module):
     def __init__(self, dice_weight=0.6, bce_weight=0.3, boundary_weight=0.2):
         super().__init__()
         self.dice = smp.losses.DiceLoss(mode='binary')
         self.bce = torch.nn.BCEWithLogitsLoss()
+        self.boundary = ConditionalBoundaryLoss()
         self.boundary_weight = boundary_weight
         self.dice_weight = dice_weight
         self.bce_weight = bce_weight
@@ -299,7 +355,7 @@ class ComboLoss(torch.nn.Module):
         loss = self.dice_weight * self.dice(outputs, targets) + \
                self.bce_weight * self.bce(outputs, targets.float())
         if self.boundary_weight > 0:
-            loss += self.boundary_weight * boundary_loss(outputs, targets)
+            loss += self.boundary_weight * self.boundary(outputs, targets)
         return loss
 
 # class ComboLoss(torch.nn.Module):
@@ -772,4 +828,62 @@ for metric_name, value in test_metrics.items():
 visualize_predictions(model, test_loader, device)
 
 writer.close()
+
+def visualize_split_distribution(dataset, scene_idx=0):
+    """Визуализирует распределение патчей и ячеек сетки для выбранной сцены."""
+    img = dataset.imgs[scene_idx]
+    h, w = img.shape[:2]
+    patch_size = dataset.patch_size
+    
+    # Вычисляем параметры сетки как в __init__
+    min_cell_size = 3 * patch_size
+    cell_size = ((min_cell_size + dataset.stride - 1) // dataset.stride) * dataset.stride
+    grid_h = max(2, (h - patch_size) // cell_size + 1)
+    grid_w = max(2, (w - patch_size) // cell_size + 1)
+    cell_h = (h - patch_size) // grid_h + 1
+    cell_w = (w - patch_size) // grid_w + 1
+    cell_size_h = ((cell_h + dataset.stride - 1) // dataset.stride) * dataset.stride
+    cell_size_w = ((cell_w + dataset.stride - 1) // dataset.stride) * dataset.stride
+    
+    # Создаем фигуру
+    plt.figure(figsize=(15, 15))
+    plt.imshow(img)
+    
+    # Отрисовываем сетку
+    for i in range(grid_h + 1):
+        y = i * cell_size_h
+        plt.axhline(y=y, color='white', linestyle='--', alpha=0.5)
+    for j in range(grid_w + 1):
+        x = j * cell_size_w
+        plt.axvline(x=x, color='white', linestyle='--', alpha=0.5)
+    
+    # Отмечаем тестовые ячейки
+    np.random.seed(dataset.random_seed)
+    all_cells = [(i, j) for i in range(grid_h) for j in range(grid_w)]
+    np.random.shuffle(all_cells)
+    n_test_cells = max(2, int(len(all_cells) * dataset.test_ratio))
+    test_cells = set(all_cells[:n_test_cells])
+    
+    for i, j in test_cells:
+        rect = patches.Rectangle(
+            (j * cell_size_w, i * cell_size_h),
+            cell_size_w, cell_size_h,
+            linewidth=2, edgecolor='red', facecolor='red', alpha=0.2
+        )
+        plt.gca().add_patch(rect)
+    
+    # Отмечаем патчи
+    for scene_i, y, x in dataset.patches:
+        if scene_i == scene_idx:
+            color = 'blue' if dataset.split != 'test' else 'yellow'
+            rect = patches.Rectangle(
+                (x, y), patch_size, patch_size,
+                linewidth=1, edgecolor=color, facecolor='none'
+            )
+            plt.gca().add_patch(rect)
+    
+    plt.title(f'Scene {scene_idx} - {dataset.split} split\nRed regions: test cells, '
+              f'{"Yellow" if dataset.split == "test" else "Blue"} boxes: patches')
+    plt.axis('off')
+    plt.show()
 
