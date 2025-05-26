@@ -17,6 +17,7 @@ from datetime import datetime
 import torch.nn.functional as F
 import matplotlib.patches as patches
 import random
+import cv2
 
 # Set random seed for reproducibility
 SEED = 42
@@ -27,34 +28,48 @@ random.seed(SEED)
 torch.backends.cudnn.deterministic = True
 torch.backends.cudnn.benchmark = False
 
-# CRF imports
-import cv2
+DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 MEAN = (0.485, 0.456, 0.406)
 STD = (0.229, 0.224, 0.225)
 
-
+########################################################
+# MODEL
+# customize model with PVTv2 encoder
+########################################################
 class PVTV2Encoder(torch.nn.Module, EncoderMixin):
+    """PVTv2 encoder for semantic segmentation.
+
+    This class implements an encoder based on the PVTv2 (Pyramid Vision Transformer v2) architecture,
+    specifically designed for semantic segmentation tasks. It wraps the PVTv2 model from the timm library
+    and adapts it to work with the segmentation_models_pytorch framework.
+
+    The encoder extracts multi-scale features from the input image using the PVTv2 backbone,
+    producing feature maps at different spatial resolutions that can be used by various decoder architectures.
+
+    Attributes:
+        _out_channels (List[int]): Number of channels in each output feature map
+        _depth (int): Number of downsampling operations in the encoder
+        _in_channels (int): Number of input channels (3 for RGB images)
+        _output_stride (int): Total downsampling factor of the encoder
+
+    Properties:
+        output_stride: Returns the total downsampling factor of the encoder
+
+    Methods:
+        forward(x): Processes input tensor and returns list of feature maps
+        load_state_dict(): Loads pretrained weights into the model
+
+    Based on https://smp.readthedocs.io/en/latest/insights.html#creating-your-own-encoder
+    """
 
     def __init__(self, **kwargs):
         super().__init__()
-
-        # Load PVTv2-B2 model
         self.model = timm.create_model('pvt_v2_b5', pretrained=True, features_only=True)
-        
-        # Get the output channels from the model
         channels = self.model.feature_info.channels()
-        
-        # A number of channels for each encoder feature tensor, list of integers
         self._out_channels = channels  # [64, 128, 320, 512]
-
-        # A number of stages in decoder (in other words number of downsampling operations)
-        self._depth = 4  # 4 уровня из PVTv2
-
-        # Default number of input channels in first Conv2d layer for encoder (usually 3)
+        self._depth = 4
         self._in_channels = 3
-
-        # Define output stride
         self._output_stride = 32
 
     @property
@@ -62,15 +77,12 @@ class PVTV2Encoder(torch.nn.Module, EncoderMixin):
         return self._output_stride
 
     def forward(self, x: torch.Tensor) -> List[torch.Tensor]:
-        """Produce list of features of different spatial resolutions."""
-        # Get features from the model (x is already normalized by albumentations)
         features = self.model(x)
         return features
 
     def load_state_dict(self, state_dict, *args, **kwargs):
         self.model.load_state_dict(state_dict, *args, **kwargs)
 
-# Регистрируем энкодер в segmentation_models_pytorch
 smp.encoders.encoders["pvt_v2_b5"] = {
     "encoder": PVTV2Encoder,  # encoder class here
     "pretrained_settings": {
@@ -92,7 +104,11 @@ model = smp.FPN(
     classes=1
 )
 
-# Tiny baseline model
+########################################################
+# MODEL
+# Tiny baseline model example
+########################################################
+
 # model = smp.UnetPlusPlus(
 #     encoder_name="efficientnet-b2", # mobilenet_v2
 #     encoder_weights="imagenet",
@@ -100,29 +116,29 @@ model = smp.FPN(
 #     classes=1
 # )
 
-# Large baseline model
-# aux_params=dict(
-#     pooling='avg',             # one of 'avg', 'max'
-#     dropout=0.5,               # dropout ratio, default is None
-#     # activation='sigmoid',      # activation function, default is None
-#     classes=1,                 # define number of output labels
-#     # in_channels=3,
-# )
 
-# model = smp.Segformer(
-#     encoder_name="mit_b5", # mobilenet_v2
-#     encoder_weights="imagenet",
-#     # aux_params=aux_params,
-#     in_channels=3,
-#     classes=1,
-# )
-
-# Определяем устройство
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-model = model.to(device)
+model = model.to(DEVICE)
 
 
+########################################################
+# DATASET
+########################################################
 class SatelliteDataset(Dataset):
+    """A PyTorch Dataset for loading satellite imagery and segmentation masks.
+
+    This dataset handles loading and preprocessing of satellite imagery and corresponding
+    segmentation masks. It splits scenes into patches using a grid-based approach and 
+    supports train/val/test splits.
+
+    Args:
+        root_dirs (Union[str, List[str]]): Path(s) to scene folder(s) containing imagery and masks
+        patch_size (int, optional): Size of extracted patches. Defaults to 512.
+        stride (int, optional): Stride between patches. Defaults to 512.
+        transform (callable, optional): Transforms to apply to patches. Defaults to None.
+        split (str, optional): Dataset split - 'train', 'val' or 'test'. Defaults to 'train'.
+        test_ratio (float, optional): Ratio of data to use for test set. Defaults to 0.1.
+        random_seed (int, optional): Random seed for reproducibility. Defaults to 42.
+    """
     def __init__(self, 
                  root_dirs, 
                  patch_size=512, 
@@ -267,10 +283,16 @@ class SatelliteDataset(Dataset):
 
 # ---- Boundary Loss ----
 def boundary_map(mask):
-    """
-    Извлекает карту границ из бинарной маски.
-    mask: [B, 1, H, W] torch tensor, значения 0/1
-    returns: [B, 1, H, W] torch tensor, значения 0-1
+    """Compute boundary map from binary segmentation mask.
+
+    This function calculates a boundary map by applying morphological operations
+    to detect edges in the binary segmentation mask.
+
+    Args:
+        mask (torch.Tensor): Binary segmentation mask tensor
+
+    Returns:
+        torch.Tensor: Boundary map tensor with same shape as input mask
     """
     # Переводим в numpy и расширяем диапазон до 0-255
     mask_np = (mask.cpu().numpy() * 255).astype(np.uint8)
@@ -288,6 +310,21 @@ def boundary_map(mask):
     return torch.from_numpy(edge_maps).float().unsqueeze(1).to(mask.device)
 
 class ConditionalBoundaryLoss(torch.nn.Module):
+    """Boundary-aware loss function for semantic segmentation.
+
+    This loss function computes a weighted boundary loss that focuses on the edges
+    of segmented regions. It uses morphological operations to detect boundaries and
+    applies higher weights to boundary pixels.
+
+    Args:
+        theta (int, optional): Boundary width parameter. Defaults to 3.
+        window_size (int, optional): Size of window for morphological operations. Defaults to 3.
+
+    Attributes:
+        theta (int): Boundary width parameter
+        window_size (int): Size of window for morphological operations
+    """
+
     def __init__(self, theta=3, window_size=3):
         super().__init__()
         self.theta = theta
@@ -295,9 +332,14 @@ class ConditionalBoundaryLoss(torch.nn.Module):
         self.pool = torch.nn.AvgPool2d(window_size, stride=1, padding=window_size//2)
     
     def forward(self, pred, target):
-        """
-        pred: Tensor of shape (N, 1, H, W) - выход модели (logits)
-        target: Tensor of shape (N, 1, H, W) - бинарные метки
+        """Compute the boundary-aware loss.
+
+        Args:
+            pred (torch.Tensor): Predicted segmentation map
+            target (torch.Tensor): Ground truth segmentation map
+
+        Returns:
+            torch.Tensor: Computed boundary loss value
         """
         # Получаем вероятности
         pred_prob = torch.sigmoid(pred)
@@ -339,6 +381,23 @@ class ConditionalBoundaryLoss(torch.nn.Module):
         return total_loss
 
 class ComboLoss(torch.nn.Module):
+    """Combined loss function for semantic segmentation.
+
+    This loss function combines multiple loss terms including Dice loss,
+    Binary Cross Entropy (BCE) loss, and boundary loss with configurable weights.
+
+    Args:
+        dice_weight (float, optional): Weight for Dice loss term. Defaults to 0.6.
+        bce_weight (float, optional): Weight for BCE loss term. Defaults to 0.3.
+        boundary_weight (float, optional): Weight for boundary loss term. Defaults to 0.2.
+
+    Attributes:
+        dice_weight (float): Weight for Dice loss term
+        bce_weight (float): Weight for BCE loss term
+        boundary_weight (float): Weight for boundary loss term
+        boundary_loss (ConditionalBoundaryLoss): Boundary loss function instance
+    """
+
     def __init__(self, dice_weight=0.6, bce_weight=0.3, boundary_weight=0.2):
         super().__init__()
         self.dice = smp.losses.DiceLoss(mode='binary')
@@ -349,6 +408,15 @@ class ComboLoss(torch.nn.Module):
         self.bce_weight = bce_weight
 
     def forward(self, outputs, targets):
+        """Compute the combined loss.
+
+        Args:
+            outputs (torch.Tensor): Model predictions
+            targets (torch.Tensor): Ground truth labels
+
+        Returns:
+            torch.Tensor: Computed combined loss value
+        """
         # Убедимся, что у targets есть размерность каналов
         if targets.ndim == 3:
             targets = targets.unsqueeze(1)
@@ -358,24 +426,22 @@ class ComboLoss(torch.nn.Module):
             loss += self.boundary_weight * self.boundary(outputs, targets)
         return loss
 
-# class ComboLoss(torch.nn.Module):
-#     def __init__(self, dice_weight=0.7, bce_weight=0.3, focal_weight=0.7):
-#         super().__init__()
-#         self.dice = smp.losses.DiceLoss(mode='binary')
-#         self.bce = torch.nn.BCEWithLogitsLoss()
-#         self.dice_weight = dice_weight
-#         self.bce_weight = bce_weight
-#         self.focal = smp.losses.FocalLoss(mode='binary')
-#         self.focal_weight = focal_weight
-        
-#     def forward(self, outputs, targets):
-#         # Убедимся, что у targets есть размерность каналов
-#         if targets.ndim == 3:
-#             targets = targets.unsqueeze(1)
-#         return self.dice_weight * self.dice(outputs, targets) + self.bce_weight * self.bce(outputs, targets.float()) + self.focal_weight * self.focal(outputs, targets)
-
 
 def visualize_predictions(model, loader, device, num_samples=4):
+    """Visualize model predictions on sample images.
+
+    This function generates and displays side-by-side comparisons of input images,
+    ground truth masks, and model predictions for a specified number of samples.
+
+    Args:
+        model (torch.nn.Module): Trained model for inference
+        loader (DataLoader): DataLoader containing validation/test data
+        device (torch.device): Device to run inference on
+        num_samples (int, optional): Number of samples to visualize. Defaults to 4.
+
+    Returns:
+        None
+    """
     model.eval()
     fig, axes = plt.subplots(num_samples, 3, figsize=(15, num_samples * 5))
     
@@ -510,6 +576,16 @@ test_loader = DataLoader(
 
 # Функция денормализации для визуализации
 def denormalize(tensor, mean=MEAN, std=STD):
+    """Denormalize an image tensor to original scale.
+
+    Args:
+        tensor (torch.Tensor): Normalized image tensor
+        mean (tuple, optional): Mean values used for normalization. Defaults to MEAN.
+        std (tuple, optional): Standard deviation values used for normalization. Defaults to STD.
+
+    Returns:
+        torch.Tensor: Denormalized image tensor
+    """
     result = tensor.clone().detach()
     for t, m, s in zip(result, mean, std):
         t.mul_(s).add_(m)
@@ -517,6 +593,18 @@ def denormalize(tensor, mean=MEAN, std=STD):
 
 # Функция для визуализации батча
 def visualize_batch(loader, title):
+    """Visualize a batch of training data.
+
+    This function displays a grid of images and their corresponding masks
+    from a single batch of the data loader.
+
+    Args:
+        loader (DataLoader): DataLoader containing the dataset
+        title (str): Title for the visualization plot
+
+    Returns:
+        None
+    """
     # Получаем один батч
     iterator = iter(loader)
     batch = next(iterator)
@@ -615,6 +703,21 @@ metrics = [
 ]
 
 def train_epoch(model, loader, optimizer, criterion, device):
+    """Train the model for one epoch.
+
+    This function performs one training epoch, iterating over all batches
+    in the data loader and updating model parameters.
+
+    Args:
+        model (torch.nn.Module): Model to train
+        loader (DataLoader): Training data loader
+        optimizer (torch.optim.Optimizer): Optimizer for parameter updates
+        criterion (torch.nn.Module): Loss function
+        device (torch.device): Device to run training on
+
+    Returns:
+        float: Average training loss for the epoch
+    """
     model.train()
     total_loss = 0
     
@@ -634,6 +737,23 @@ def train_epoch(model, loader, optimizer, criterion, device):
     return total_loss / len(loader)
 
 def validate(model, loader, criterion, metrics, device, writer, epoch):
+    """Validate the model on validation dataset.
+
+    This function evaluates the model performance on the validation set,
+    computing various metrics and logging results to TensorBoard.
+
+    Args:
+        model (torch.nn.Module): Model to evaluate
+        loader (DataLoader): Validation data loader
+        criterion (torch.nn.Module): Loss function
+        metrics (dict): Dictionary of metric functions to compute
+        device (torch.device): Device to run validation on
+        writer (SummaryWriter): TensorBoard writer instance
+        epoch (int): Current epoch number
+
+    Returns:
+        tuple: Average validation loss and metrics dictionary
+    """
     model.eval()
     total_loss = 0
     
@@ -786,8 +906,8 @@ exp_name = f"runs/segmentation_experiment_{datetime.now().strftime('%Y%m%d_%H%M%
 writer = SummaryWriter(log_dir=exp_name)
 
 for epoch in range(num_epochs):
-    train_loss = train_epoch(model, train_loader, optimizer, criterion, device)
-    val_loss, val_metrics = validate(model, val_loader, criterion, metrics, device, writer, epoch)
+    train_loss = train_epoch(model, train_loader, optimizer, criterion, DEVICE)
+    val_loss, val_metrics = validate(model, val_loader, criterion, metrics, DEVICE, writer, epoch)
     
     writer.add_scalar('Loss/train', train_loss, epoch)
     writer.add_scalar('Loss/val', val_loss, epoch)
@@ -815,10 +935,10 @@ for epoch in range(num_epochs):
         break
 
 # Загрузка лучшей модели
-model.load_state_dict(torch.load('best_model.pth'))
+model.load_state_dict(torch.load(f"{exp_name}/best_model.pth"))
 
 # Тестирование на тестовом наборе
-test_loss, test_metrics = validate(model, val_loader, criterion, metrics, device, writer, epoch+1)
+test_loss, test_metrics = validate(model, val_loader, criterion, metrics, DEVICE, writer, epoch+1)
 print('\nTest Results:')
 print(f'Test Loss: {test_loss:.4f}')
 print('Test Metrics:')
@@ -826,12 +946,23 @@ for metric_name, value in test_metrics.items():
     print(f'{metric_name}: {value:.4f}')
 
 # Визуализация предсказаний
-visualize_predictions(model, test_loader, device)
+visualize_predictions(model, test_loader, DEVICE)
 
 writer.close()
 
 def visualize_split_distribution(dataset, scene_idx=0):
-    """Визуализирует распределение патчей и ячеек сетки для выбранной сцены."""
+    """Visualize the train/val/test split distribution for a scene.
+
+    This function creates a visualization showing how patches are distributed
+    across different splits in the dataset for a given scene.
+
+    Args:
+        dataset (SatelliteDataset): Dataset instance to visualize
+        scene_idx (int, optional): Index of the scene to visualize. Defaults to 0.
+
+    Returns:
+        None
+    """
     img = dataset.imgs[scene_idx]
     h, w = img.shape[:2]
     patch_size = dataset.patch_size
