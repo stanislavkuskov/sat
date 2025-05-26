@@ -782,7 +782,8 @@ patience = 10
 patience_counter = 0
 epoch = 0
 
-writer = SummaryWriter(log_dir=f"runs/segmentation_experiment_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
+exp_name = f"runs/segmentation_experiment_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+writer = SummaryWriter(log_dir=exp_name)
 
 for epoch in range(num_epochs):
     train_loss = train_epoch(model, train_loader, optimizer, criterion, device)
@@ -802,7 +803,7 @@ for epoch in range(num_epochs):
     
     if val_metrics['iou_score'] > best_val_iou:
         best_val_iou = val_metrics['iou_score']
-        torch.save(model.state_dict(), 'best_model.pth')
+        torch.save(model.state_dict(), f"{exp_name}/best_model.pth")
         patience_counter = 0
         print(f'New best IoU: {best_val_iou:.4f}')
     else:
