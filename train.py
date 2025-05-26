@@ -15,6 +15,7 @@ from typing import List
 from segmentation_models_pytorch.encoders._base import EncoderMixin
 from datetime import datetime
 import torch.nn.functional as F
+import matplotlib.patches as patches
 
 # Set random seed for reproducibility
 SEED = 42
@@ -121,25 +122,23 @@ device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 model = model.to(device)
 
 
-class SatPatchDataset(Dataset):
+class SatelliteDataset(Dataset):
     def __init__(self, 
                  root_dirs, 
                  patch_size=512, 
                  stride=512, 
                  transform=None, 
                  split='train', 
-                 val_ratio=0.2, 
                  test_ratio=0.1, 
                  random_seed=42):
         """
-        root_dirs: список путей к папкам сцен (например, ['data/ventura', 'data/santa_rosa'])
-        patch_size: размер патча (по умолчанию 512)
-        stride: шаг нарезки (по умолчанию 512, без перекрытия)
-        transform: аугментации/преобразования
-        split: 'train', 'val' или 'test'
-        val_ratio: доля валидации
-        test_ratio: доля теста
-        random_seed: для воспроизводимости
+        root_dirs: List of paths to scene folders (e.g., ['data/ventura', 'data/santa_rosa'])
+        patch_size: Patch size (default 512)
+        stride: Stride for patch extraction (default 512)
+        transform: Augmentations/transforms
+        split: 'train', 'val', or 'test'
+        test_ratio: Ratio of test set (default 0.1)
+        random_seed: For reproducibility
         """
         if isinstance(root_dirs, str):
             root_dirs = [root_dirs]
@@ -148,41 +147,81 @@ class SatPatchDataset(Dataset):
         self.stride = stride
         self.transform = transform
         self.split = split
-        self.val_ratio = val_ratio
         self.test_ratio = test_ratio
         self.random_seed = random_seed
 
-        # Собираем все патчи из всех сцен
-        self.all_patches = []  # (scene_idx, y, x)
+        # Read all images and masks
         self.imgs = []
         self.masks = []
-        for scene_idx, scene_dir in enumerate(self.root_dirs):
+        for scene_dir in self.root_dirs:
             img = self._read_rgb(scene_dir)
             mask = self._read_mask(scene_dir)
             assert img.shape[:2] == mask.shape[:2], f"Image and mask size mismatch in {scene_dir}!"
             self.imgs.append(img)
             self.masks.append(mask)
+
+        # Set random seed for reproducibility
+        np.random.seed(self.random_seed)
+
+        # Create patches list for all scenes
+        self.patches = []  # (scene_idx, y, x)
+        for scene_idx, img in enumerate(self.imgs):
             h, w = img.shape[:2]
+            
+            # Делаем размер ячейки в 3-4 раза больше patch_size, кратным stride
+            min_cell_size = 3 * patch_size
+            cell_size = ((min_cell_size + stride - 1) // stride) * stride
+            
+            # Вычисляем количество ячеек сетки
+            grid_h = max(2, (h - patch_size) // cell_size + 1)  # минимум 2x2 сетка
+            grid_w = max(2, (w - patch_size) // cell_size + 1)
+            
+            # Корректируем размер ячейки, чтобы равномерно покрыть изображение
+            cell_h = (h - patch_size) // grid_h + 1
+            cell_w = (w - patch_size) // grid_w + 1
+            # Округляем до кратного stride
+            cell_size_h = ((cell_h + stride - 1) // stride) * stride
+            cell_size_w = ((cell_w + stride - 1) // stride) * stride
+            
+            # Randomly select grid cells for test set
+            n_cells = grid_h * grid_w
+            n_test_cells = max(2, int(n_cells * self.test_ratio))  # минимум 2 ячейки для теста
+            all_cells = [(i, j) for i in range(grid_h) for j in range(grid_w)]
+            np.random.shuffle(all_cells)
+            test_cells = set(all_cells[:n_test_cells])
+            
+            # Generate patches based on split
             for y in range(0, h - self.patch_size + 1, self.stride):
                 for x in range(0, w - self.patch_size + 1, self.stride):
-                    self.all_patches.append((scene_idx, y, x))
+                    # Проверяем все четыре угла патча
+                    patch_corners = [
+                        (y // cell_size_h, x // cell_size_w),  # верхний левый
+                        (y // cell_size_h, (x + patch_size - 1) // cell_size_w),  # верхний правый
+                        ((y + patch_size - 1) // cell_size_h, x // cell_size_w),  # нижний левый
+                        ((y + patch_size - 1) // cell_size_h, (x + patch_size - 1) // cell_size_w)  # нижний правый
+                    ]
+                    
+                    # Проверяем, все ли углы патча находятся в одном типе ячеек (тест или не тест)
+                    corners_in_test = sum(1 for corner in patch_corners if corner in test_cells)
+                    
+                    if split == 'test':
+                        # Для тестового набора все углы должны быть в тестовых ячейках
+                        if corners_in_test == len(patch_corners):
+                            self.patches.append((scene_idx, y, x))
+                    else:  # train/val
+                        # Для train/val ни один угол не должен быть в тестовых ячейках
+                        if corners_in_test == 0:
+                            self.patches.append((scene_idx, y, x))
 
-        # Разделяем на train/val/test
-        np.random.seed(self.random_seed)
-        indices = np.arange(len(self.all_patches))
-        np.random.shuffle(indices)
-        n_total = len(indices)
-        n_test = int(n_total * self.test_ratio)
-        n_val = int(n_total * self.val_ratio)
-        n_train = n_total - n_val - n_test
-        if self.split == 'train':
-            self.indices = indices[:n_train]
-        elif self.split == 'val':
-            self.indices = indices[n_train:n_train+n_val]
-        elif self.split == 'test':
-            self.indices = indices[n_train+n_val:]
-        else:
-            raise ValueError(f"Unknown split: {self.split}")
+        # For train/val split, randomly assign patches
+        if split != 'test':
+            np.random.shuffle(self.patches)
+            n_total = len(self.patches)
+            n_train = int(n_total * 0.8)  # 80% for training
+            if split == 'train':
+                self.patches = self.patches[:n_train]
+            else:  # val
+                self.patches = self.patches[n_train:]  # remaining 20% for validation
 
     def _read_rgb(self, scene_dir):
         r = self._read_tif(os.path.join(scene_dir, 'RED.tif'))
@@ -205,27 +244,25 @@ class SatPatchDataset(Dataset):
         return arr
 
     def __len__(self):
-        return len(self.indices)
+        return len(self.patches)
 
     def __getitem__(self, idx):
-        patch_idx = self.indices[idx]
-        scene_idx, y, x = self.all_patches[patch_idx]
+        scene_idx, y, x = self.patches[idx]
         img_patch = self.imgs[scene_idx][y:y+self.patch_size, x:x+self.patch_size, :]
         mask_patch = self.masks[scene_idx][y:y+self.patch_size, x:x+self.patch_size]
+        
         if self.transform:
             augmented = self.transform(image=img_patch, mask=mask_patch)
-            img_patch = augmented['image']  # Уже torch.Tensor (C, H, W)
+            img_patch = augmented['image']  # Already torch.Tensor (C, H, W)
             mask_patch = augmented['mask']
-            # mask_patch может быть либо np.ndarray, либо torch.Tensor
             if not isinstance(mask_patch, torch.Tensor):
                 mask_patch = torch.from_numpy(mask_patch).long()
-            # Добавляем размерность каналов
             mask_patch = mask_patch.unsqueeze(0)
         else:
             img_patch = torch.from_numpy(img_patch).permute(2, 0, 1)
             mask_patch = torch.from_numpy(mask_patch).long()
-            # Добавляем размерность каналов
             mask_patch = mask_patch.unsqueeze(0)
+        
         return {'img': img_patch, 'mask': mask_patch, 'coords': (scene_idx, y, x)}
 
 # ---- Boundary Loss ----
@@ -358,37 +395,34 @@ train_transform = A.Compose([
 patch_size = 224
 stride = 32
 # Создаем датасеты для train, val и test
-train_dataset = SatPatchDataset(
+train_dataset = SatelliteDataset(
     root_dirs=data_dirs,
     patch_size=patch_size,
     stride=stride,
     transform=train_transform,
-    split='train',  # Используем train сплит
-    val_ratio=0.2,
+    split='train',
     test_ratio=0.1,
-    random_seed=42
+    random_seed=SEED
 )
 
-val_dataset = SatPatchDataset(
+val_dataset = SatelliteDataset(
     root_dirs=data_dirs,
     patch_size=patch_size,
     stride=stride,
     transform=val_transform, 
-    split='val',  # Используем val сплит
-    val_ratio=0.2,
+    split='val',
     test_ratio=0.1,
-    random_seed=42
+    random_seed=SEED
 )
 
-test_dataset = SatPatchDataset(
+test_dataset = SatelliteDataset(
     root_dirs=data_dirs,
     patch_size=patch_size,
     stride=stride,
     transform=val_transform,
-    split='test',  # Используем test сплит
-    val_ratio=0.2,
+    split='test',
     test_ratio=0.1,
-    random_seed=42
+    random_seed=SEED
 )
 
 # Создаем DataLoader для каждого датасета
@@ -477,7 +511,29 @@ def visualize_batch(loader, title):
     print(f"{title} - Background pixels: {total_pixels - building_pixels} ({100 - building_percent:.2f}%)")
 
 # Визуализация данных из всех сплитов
-print("Dataset sizes:")
+print("\nDataset statistics:")
+print(f"Train patches: {len(train_dataset)} ({len(train_dataset)/(len(train_dataset) + len(val_dataset) + len(test_dataset))*100:.1f}%)")
+print(f"Val patches: {len(val_dataset)} ({len(val_dataset)/(len(train_dataset) + len(val_dataset) + len(test_dataset))*100:.1f}%)")
+print(f"Test patches: {len(test_dataset)} ({len(test_dataset)/(len(train_dataset) + len(val_dataset) + len(test_dataset))*100:.1f}%)")
+print(f"Total patches: {len(train_dataset) + len(val_dataset) + len(test_dataset)}")
+
+# Анализ распределения патчей по сценам
+scene_stats = {'train': {}, 'val': {}, 'test': {}}
+for split, dataset in [('train', train_dataset), ('val', val_dataset), ('test', test_dataset)]:
+    for patch in dataset.patches:
+        scene_idx = patch[0]
+        scene_stats[split][scene_idx] = scene_stats[split].get(scene_idx, 0) + 1
+
+print("\nPatch distribution by scene:")
+for scene_idx in range(len(train_dataset.root_dirs)):
+    print(f"\nScene {scene_idx} ({train_dataset.root_dirs[scene_idx]}):")
+    total_scene_patches = sum(stats.get(scene_idx, 0) for stats in scene_stats.values())
+    for split in ['train', 'val', 'test']:
+        count = scene_stats[split].get(scene_idx, 0)
+        percentage = count/total_scene_patches*100 if total_scene_patches > 0 else 0
+        print(f"  {split}: {count} patches ({percentage:.1f}%)")
+
+print("\nDataset sizes:")
 print(f"Train: {len(train_dataset)}")
 print(f"Validation: {len(val_dataset)}")
 print(f"Test: {len(test_dataset)}")
