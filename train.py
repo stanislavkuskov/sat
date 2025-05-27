@@ -770,51 +770,35 @@ def visualize_splits_overlap(train_dataset, val_dataset, test_dataset, scene_idx
         x = j * cell_size_w
         plt.axvline(x=x, color='white', linestyle='--', alpha=0.3)
     
-    # Draw patches for each split with different colors and styles
+    # Colors for visualization
     colors = {
-        'train': ('blue', 0.3),
-        'val': ('red', 0.3),
-        'test': ('yellow', 0.3)
+        'train': 'blue',
+        'val': 'red',
+        'test': 'yellow'
     }
     
-    # Draw test patches first (they will be at the bottom)
-    for scene_i, y, x in test_dataset.patches:
-        if scene_i == scene_idx:
-            rect = patches.Rectangle(
-                (x, y), patch_size, patch_size,
-                linewidth=2, edgecolor=colors['test'][0], 
-                facecolor='none',
-                alpha=1.0
-            )
-            plt.gca().add_patch(rect)
-    
-    # Then validation patches
-    for scene_i, y, x in val_dataset.patches:
-        if scene_i == scene_idx:
-            rect = patches.Rectangle(
-                (x, y), patch_size, patch_size,
-                linewidth=2, edgecolor=colors['val'][0], 
-                facecolor='none',
-                alpha=1.0
-            )
-            plt.gca().add_patch(rect)
-    
-    # Finally train patches (they will be on top)
-    for scene_i, y, x in train_dataset.patches:
-        if scene_i == scene_idx:
-            rect = patches.Rectangle(
-                (x, y), patch_size, patch_size,
-                linewidth=2, edgecolor=colors['train'][0], 
-                facecolor='none',
-                alpha=1.0
-            )
-            plt.gca().add_patch(rect)
+    # Draw patches in order: test (3px) -> val (2px) -> train (1px)
+    for split_name, dataset, line_width in [
+        ('test', test_dataset, 3),
+        ('val', val_dataset, 2), 
+        ('train', train_dataset, 1)
+    ]:
+        for scene_i, y, x in dataset.patches:
+            if scene_i == scene_idx:
+                rect = plt.Rectangle(
+                    (x, y), patch_size, patch_size,
+                    linewidth=line_width,
+                    edgecolor=colors[split_name],
+                    facecolor='none',
+                    alpha=1.0
+                )
+                plt.gca().add_patch(rect)
     
     # Add legend
     legend_elements = [
-        patches.Patch(facecolor='none', edgecolor='blue', label='Train'),
-        patches.Patch(facecolor='none', edgecolor='red', label='Val'),
-        patches.Patch(facecolor='none', edgecolor='yellow', label='Test')
+        plt.Rectangle((0, 0), 1, 1, facecolor='none', edgecolor='blue', linewidth=1, label='Train'),
+        plt.Rectangle((0, 0), 1, 1, facecolor='none', edgecolor='red', linewidth=2, label='Val'),
+        plt.Rectangle((0, 0), 1, 1, facecolor='none', edgecolor='yellow', linewidth=3, label='Test')
     ]
     plt.legend(handles=legend_elements, loc='upper right')
     plt.axis('off')
