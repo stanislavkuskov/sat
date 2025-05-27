@@ -236,54 +236,108 @@ class SatelliteDataset(Dataset):
         # Set random seed for reproducibility
         np.random.seed(self.random_seed)
 
-        # Read all images and masks
+        # Read all images and masks and store their padded versions
         self.imgs = []
         self.masks = []
+        self.padded_imgs = []
+        self.padded_masks = []
+        self.padding_info = []  # Store padding information for each scene
+        
         for scene_dir in self.root_dirs:
             img = self._read_rgb(scene_dir)
             mask = self._read_mask(scene_dir)
             assert img.shape[:2] == mask.shape[:2], f"Image and mask size mismatch in {scene_dir}!"
+            
+            h, w = img.shape[:2]
+            cell_size = 2 * patch_size
+            
+            # First add padding for edge handling (half patch_size on each side)
+            pad_size = patch_size // 2
+            edge_padded_h = h + 2 * pad_size
+            edge_padded_w = w + 2 * pad_size
+            
+            # Create edge padded versions
+            edge_padded_img = np.zeros((edge_padded_h, edge_padded_w, 3), dtype=img.dtype)
+            edge_padded_mask = np.zeros((edge_padded_h, edge_padded_w), dtype=mask.dtype)
+            
+            # Copy original content to the center
+            edge_padded_img[pad_size:pad_size+h, pad_size:pad_size+w] = img
+            edge_padded_mask[pad_size:pad_size+h, pad_size:pad_size+w] = mask
+            
+            # Then extend to make dimensions divisible by cell_size
+            final_h = ((edge_padded_h + cell_size - 1) // cell_size) * cell_size
+            final_w = ((edge_padded_w + cell_size - 1) // cell_size) * cell_size
+            
+            # Calculate additional padding needed for cell_size divisibility
+            extra_pad_h = final_h - edge_padded_h
+            extra_pad_w = final_w - edge_padded_w
+            
+            # Create final padded versions
+            padded_img = np.zeros((final_h, final_w, 3), dtype=img.dtype)
+            padded_mask = np.zeros((final_h, final_w), dtype=mask.dtype)
+            
+            # Copy edge padded content (centered in final padding)
+            extra_top = extra_pad_h // 2
+            extra_left = extra_pad_w // 2
+            padded_img[extra_top:extra_top+edge_padded_h, extra_left:extra_left+edge_padded_w] = edge_padded_img
+            padded_mask[extra_top:extra_top+edge_padded_h, extra_left:extra_left+edge_padded_w] = edge_padded_mask
+            
             self.imgs.append(img)
             self.masks.append(mask)
+            self.padded_imgs.append(padded_img)
+            self.padded_masks.append(padded_mask)
+            self.padding_info.append({
+                'original_h': h,
+                'original_w': w,
+                'pad_size': pad_size,
+                'edge_padded_h': edge_padded_h,
+                'edge_padded_w': edge_padded_w,
+                'extra_top': extra_top,
+                'extra_left': extra_left,
+                'final_h': final_h,
+                'final_w': final_w
+            })
 
         # Initialize patches list
         self.patches = []  # (scene_idx, y, x)
         
         # Process each scene
-        for scene_idx, (img, mask) in enumerate(zip(self.imgs, self.masks)):
-            h, w = img.shape[:2]
+        for scene_idx, (padded_img, padded_mask, padding) in enumerate(zip(self.padded_imgs, self.padded_masks, self.padding_info)):
+            # Calculate grid dimensions
+            grid_h = padding['final_h'] // cell_size
+            grid_w = padding['final_w'] // cell_size
             
-            # Calculate cell size (2 times patch_size)
-            cell_size = 2 * patch_size
+            # Total offset from original image coordinates
+            total_top_offset = padding['pad_size'] + padding['extra_top']
+            total_left_offset = padding['pad_size'] + padding['extra_left']
             
-            # Calculate required padding to make image dimensions divisible by cell_size
-            pad_h = (cell_size - h % cell_size) % cell_size
-            pad_w = (cell_size - w % cell_size) % cell_size
-            
-            # Calculate grid dimensions for padded image
-            grid_h = (h + pad_h) // cell_size
-            grid_w = (w + pad_w) // cell_size
-            
-            # Calculate building density for each cell
+            # Calculate densities and assign cells to splits
             densities = {}
             for i in range(grid_h):
                 for j in range(grid_w):
-                    # Define cell boundaries
+                    # Define cell boundaries in padded coordinates
                     y_start = i * cell_size
-                    y_end = min((i + 1) * cell_size, h)  # Don't go beyond original image
+                    y_end = (i + 1) * cell_size
                     x_start = j * cell_size
-                    x_end = min((j + 1) * cell_size, w)  # Don't go beyond original image
+                    x_end = (j + 1) * cell_size
                     
-                    # Calculate density
-                    cell_mask = mask[y_start:y_end, x_start:x_end]
+                    # Convert to original image coordinates for density calculation
+                    orig_y_start = max(0, min(padding['original_h'], y_start - total_top_offset))
+                    orig_y_end = max(0, min(padding['original_h'], y_end - total_top_offset))
+                    orig_x_start = max(0, min(padding['original_w'], x_start - total_left_offset))
+                    orig_x_end = max(0, min(padding['original_w'], x_end - total_left_offset))
+                    
+                    # Calculate density using original image coordinates
+                    cell_mask = self.masks[scene_idx][orig_y_start:orig_y_end, orig_x_start:orig_x_end]
                     building_pixels = np.sum(cell_mask > 0)
                     total_pixels = cell_mask.size
                     density = building_pixels / total_pixels if total_pixels > 0 else 0
+                    
                     densities[(i, j)] = {
                         'density': density,
                         'building_pixels': building_pixels,
                         'total_pixels': total_pixels,
-                        'bounds': (y_start, y_end, x_start, x_end)
+                        'bounds': (y_start, y_end, x_start, x_end)  # Store padded coordinates
                     }
             
             # Assign cells to splits
@@ -292,23 +346,33 @@ class SatelliteDataset(Dataset):
             # Generate patches for the current split
             if self.split in cell_splits:
                 for cell in cell_splits[self.split]:
-                    cell_info = densities[cell]
-                    y_start, y_end, x_start, x_end = cell_info['bounds']
+                    y_start, y_end, x_start, x_end = densities[cell]['bounds']
                     
                     # Generate patches with stride
                     for y in range(y_start, y_end - patch_size + 1, stride):
                         for x in range(x_start, x_end - patch_size + 1, stride):
-                            if y + patch_size <= h and x + patch_size <= w:  # Ensure patch is within original image
-                                self.patches.append((scene_idx, y, x))
+                            # Store padded coordinates
+                            self.patches.append((scene_idx, y, x))
 
             print(f"\nScene {scene_idx} Statistics:")
-            print(f"Original size: {h}x{w}")
-            print(f"Padding: {pad_h}x{pad_w}")
+            print(f"Original size: {padding['original_h']}x{padding['original_w']}")
+            print(f"Edge padding size: {padding['pad_size']} on each side")
+            print(f"Size after edge padding: {padding['edge_padded_h']}x{padding['edge_padded_w']}")
+            print(f"Additional padding for cell size divisibility: top={padding['extra_top']}, left={padding['extra_left']}")
+            print(f"Final size: {padding['final_h']}x{padding['final_w']}")
             print(f"Grid size: {grid_h}x{grid_w} cells")
+            print(f"Cell size: {cell_size}x{cell_size} pixels")
+            print(f"Patch size: {patch_size}x{patch_size} pixels")
+            print(f"Stride: {stride} pixels")
+            
             for split_name, cells in cell_splits.items():
                 total_building_pixels = sum(densities[cell]['building_pixels'] for cell in cells)
-                print(f"{split_name.capitalize()} cells: {len(cells)}, "
-                      f"Building pixels: {total_building_pixels}")
+                total_pixels = sum(densities[cell]['total_pixels'] for cell in cells)
+                density = total_building_pixels / total_pixels if total_pixels > 0 else 0
+                print(f"\n{split_name.capitalize()}:")
+                print(f"  Cells: {len(cells)}")
+                print(f"  Building pixels: {total_building_pixels}")
+                print(f"  Building density: {density*100:.1f}%")
 
     def _read_rgb(self, scene_dir):
         r = self._read_tif(os.path.join(scene_dir, 'RED.tif'))
@@ -336,9 +400,9 @@ class SatelliteDataset(Dataset):
     def __getitem__(self, idx):
         scene_idx, y, x = self.patches[idx]
         
-        # Get padded patches
-        img_patch = self.imgs[scene_idx][y:y+self.patch_size, x:x+self.patch_size]
-        mask_patch = self.masks[scene_idx][y:y+self.patch_size, x:x+self.patch_size]
+        # Get patches from padded images
+        img_patch = self.padded_imgs[scene_idx][y:y+self.patch_size, x:x+self.patch_size]
+        mask_patch = self.padded_masks[scene_idx][y:y+self.patch_size, x:x+self.patch_size]
         
         if self.transform:
             augmented = self.transform(image=img_patch, mask=mask_patch)
@@ -355,32 +419,21 @@ class SatelliteDataset(Dataset):
         return {'img': img_patch, 'mask': mask_patch, 'coords': (scene_idx, y, x)}
 
     def visualize_split(self, scene_idx=0):
-        """Visualize dataset split for a given scene.
-        
-        Args:
-            scene_idx (int): Index of scene to visualize
-        """
-        # Get original image and mask
+        """Visualize dataset split for a given scene."""
+        # Get original and padded images/masks
         img = self.imgs[scene_idx]
         mask = self.masks[scene_idx]
-        h, w = img.shape[:2]
+        padded_img = self.padded_imgs[scene_idx]
+        padded_mask = self.padded_masks[scene_idx]
+        padding = self.padding_info[scene_idx]
         
-        # Calculate cell size and padding
         cell_size = 2 * self.patch_size
-        pad_h = (cell_size - h % cell_size) % cell_size
-        pad_w = (cell_size - w % cell_size) % cell_size
+        grid_h = padding['final_h'] // cell_size
+        grid_w = padding['final_w'] // cell_size
         
-        # Create padded image and mask
-        padded_h = h + pad_h
-        padded_w = w + pad_w
-        padded_img = np.zeros((padded_h, padded_w, 3), dtype=img.dtype)
-        padded_mask = np.zeros((padded_h, padded_w), dtype=mask.dtype)
-        padded_img[:h, :w] = img
-        padded_mask[:h, :w] = mask
-        
-        # Calculate grid dimensions
-        grid_h = padded_h // cell_size
-        grid_w = padded_w // cell_size
+        # Total offset from original image coordinates
+        total_top_offset = padding['pad_size'] + padding['extra_top']
+        total_left_offset = padding['pad_size'] + padding['extra_left']
         
         # Create visualization
         plt.figure(figsize=(20, 10))
@@ -409,23 +462,29 @@ class SatelliteDataset(Dataset):
         densities = {}
         for i in range(grid_h):
             for j in range(grid_w):
-                # Define cell boundaries
+                # Define cell boundaries in padded coordinates
                 y_start = i * cell_size
-                y_end = min((i + 1) * cell_size, padded_h)
+                y_end = (i + 1) * cell_size
                 x_start = j * cell_size
-                x_end = min((j + 1) * cell_size, padded_w)
+                x_end = (j + 1) * cell_size
                 
-                # Calculate density (only for the non-padded part of the cell)
-                cell_mask = mask[max(0, min(h, y_start)):max(0, min(h, y_end)),
-                               max(0, min(w, x_start)):max(0, min(w, x_end))]
+                # Convert to original image coordinates for density calculation
+                orig_y_start = max(0, min(padding['original_h'], y_start - total_top_offset))
+                orig_y_end = max(0, min(padding['original_h'], y_end - total_top_offset))
+                orig_x_start = max(0, min(padding['original_w'], x_start - total_left_offset))
+                orig_x_end = max(0, min(padding['original_w'], x_end - total_left_offset))
+                
+                # Calculate density using original image coordinates
+                cell_mask = mask[orig_y_start:orig_y_end, orig_x_start:orig_x_end]
                 building_pixels = np.sum(cell_mask > 0)
                 total_pixels = cell_mask.size
                 density = building_pixels / total_pixels if total_pixels > 0 else 0
+                
                 densities[(i, j)] = {
                     'density': density,
                     'building_pixels': building_pixels,
                     'total_pixels': total_pixels,
-                    'bounds': (y_start, y_end, x_start, x_end)
+                    'bounds': (y_start, y_end, x_start, x_end)  # Store padded coordinates
                 }
         
         # Assign cells to splits
@@ -478,8 +537,11 @@ class SatelliteDataset(Dataset):
         
         # Print statistics
         print(f"\nScene {scene_idx} Statistics:")
-        print(f"Original size: {h}x{w}")
-        print(f"Padded size: {padded_h}x{padded_w} (padding: {pad_h}x{pad_w})")
+        print(f"Original size: {padding['original_h']}x{padding['original_w']}")
+        print(f"Edge padding size: {padding['pad_size']} on each side")
+        print(f"Size after edge padding: {padding['edge_padded_h']}x{padding['edge_padded_w']}")
+        print(f"Additional padding for cell size divisibility: top={padding['extra_top']}, left={padding['extra_left']}")
+        print(f"Final size: {padding['final_h']}x{padding['final_w']}")
         print(f"Grid size: {grid_h}x{grid_w} cells")
         print(f"Cell size: {cell_size}x{cell_size} pixels")
         print(f"Patch size: {self.patch_size}x{self.patch_size} pixels")
