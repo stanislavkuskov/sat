@@ -128,8 +128,8 @@ class SatelliteDataset(Dataset):
     """A PyTorch Dataset for loading satellite imagery and segmentation masks.
 
     This dataset handles loading and preprocessing of satellite imagery and corresponding
-    segmentation masks. It splits scenes into patches using a grid-based approach and 
-    supports train/val/test splits.
+    segmentation masks. It first splits scenes into cells, assigns cells to train/val/test
+    splits based on building density, and then generates patches within those cells.
 
     Args:
         root_dirs (Union[str, List[str]]): Path(s) to scene folder(s) containing imagery and masks
@@ -141,63 +141,79 @@ class SatelliteDataset(Dataset):
         random_seed (int, optional): Random seed for reproducibility. Defaults to 42.
     """
     def _calculate_cell_building_density(self, mask, cell_size_h, cell_size_w, grid_h, grid_w):
-        """Вычисляет плотность зданий для каждой ячейки сетки."""
+        """Calculate building density for each grid cell."""
         densities = {}
+        h, w = mask.shape[:2]
+        
+        # Calculate padding size (half of patch_size)
+        pad_size = self.patch_size // 2
+        
         for i in range(grid_h):
             for j in range(grid_w):
-                # Определяем границы ячейки
-                y_start = i * cell_size_h
-                y_end = min((i + 1) * cell_size_h, mask.shape[0])
-                x_start = j * cell_size_w
-                x_end = min((j + 1) * cell_size_w, mask.shape[1])
+                # Define cell boundaries with padding
+                y_start = max(0, i * cell_size_h - pad_size)
+                y_end = min(h, (i + 1) * cell_size_h + pad_size)
+                x_start = max(0, j * cell_size_w - pad_size)
+                x_end = min(w, (j + 1) * cell_size_w + pad_size)
                 
-                # Вычисляем плотность зданий в ячейке
+                # Calculate density
                 cell_mask = mask[y_start:y_end, x_start:x_end]
                 building_pixels = np.sum(cell_mask > 0)
                 total_pixels = cell_mask.size
                 density = building_pixels / total_pixels if total_pixels > 0 else 0
-                densities[(i, j)] = density
-                
-                # Отладочный вывод для проверки плотности
-                if building_pixels > 0:
-                    print(f"Cell ({i},{j}) has density {density:.3f} ({building_pixels}/{total_pixels} pixels)")
+                densities[(i, j)] = {
+                    'density': density,
+                    'building_pixels': building_pixels,
+                    'total_pixels': total_pixels,
+                    'bounds': (y_start, y_end, x_start, x_end)
+                }
         
         return densities
 
-    def _pad_patch(self, img, mask, y, x, patch_size):
-        """Pad patch with zeros if it extends beyond image boundaries.
+    def _assign_cells_to_splits(self, densities, test_ratio=0.1, val_ratio=0.1):
+        """Assign cells to train/val/test splits ensuring balanced building distribution."""
+        # Sort cells by density
+        cells = list(densities.items())
+        cells.sort(key=lambda x: x[1]['density'], reverse=True)
         
-        Args:
-            img (np.ndarray): Source image
-            mask (np.ndarray): Source mask
-            y (int): Y coordinate of patch top-left corner
-            x (int): X coordinate of patch top-left corner
-            patch_size (int): Size of the patch
-            
-        Returns:
-            tuple: (padded_img, padded_mask, is_valid)
-        """
-        h, w = img.shape[:2]
+        # Calculate total building pixels
+        total_building_pixels = sum(info['building_pixels'] for _, info in cells)
+        target_test_pixels = total_building_pixels * test_ratio
+        target_val_pixels = total_building_pixels * val_ratio
         
-        # Calculate actual patch dimensions
-        actual_h = min(patch_size, h - y)
-        actual_w = min(patch_size, w - x)
+        # Initialize splits
+        splits = {
+            'test': [],
+            'val': [],
+            'train': []
+        }
+        current_test_pixels = 0
+        current_val_pixels = 0
         
-        # Create empty patches
-        if len(img.shape) == 3:
-            padded_img = np.zeros((patch_size, patch_size, img.shape[2]), dtype=img.dtype)
-        else:
-            padded_img = np.zeros((patch_size, patch_size), dtype=img.dtype)
-        padded_mask = np.zeros((patch_size, patch_size), dtype=mask.dtype)
+        # Assign cells to splits
+        for cell, info in cells:
+            if current_test_pixels < target_test_pixels:
+                splits['test'].append(cell)
+                current_test_pixels += info['building_pixels']
+            elif current_val_pixels < target_val_pixels:
+                splits['val'].append(cell)
+                current_val_pixels += info['building_pixels']
+            else:
+                splits['train'].append(cell)
         
-        # Copy actual data
-        padded_img[:actual_h, :actual_w] = img[y:y+actual_h, x:x+actual_w]
-        padded_mask[:actual_h, :actual_w] = mask[y:y+actual_h, x:x+actual_w]
+        return splits
+
+    def _generate_patches_for_cell(self, cell_bounds, stride):
+        """Generate patch coordinates within a cell."""
+        y_start, y_end, x_start, x_end = cell_bounds
+        patches = []
         
-        # Check if patch contains any buildings
-        has_buildings = np.any(padded_mask > 0)
+        # Generate patches with stride, ensuring they don't go beyond image boundaries
+        for y in range(y_start, y_end - self.patch_size + 1, stride):
+            for x in range(x_start, x_end - self.patch_size + 1, stride):
+                patches.append((y, x))
         
-        return padded_img, padded_mask, has_buildings
+        return patches
 
     def __init__(self, 
                  root_dirs, 
@@ -207,15 +223,6 @@ class SatelliteDataset(Dataset):
                  split='train', 
                  test_ratio=0.1, 
                  random_seed=42):
-        """
-        root_dirs: List of paths to scene folders (e.g., ['data/ventura', 'data/santa_rosa'])
-        patch_size: Patch size (default 512)
-        stride: Stride for patch extraction (default 512)
-        transform: Augmentations/transforms
-        split: 'train', 'val', or 'test'
-        test_ratio: Ratio of test set (default 0.1)
-        random_seed: For reproducibility
-        """
         if isinstance(root_dirs, str):
             root_dirs = [root_dirs]
         self.root_dirs = root_dirs
@@ -225,6 +232,9 @@ class SatelliteDataset(Dataset):
         self.split = split
         self.test_ratio = test_ratio
         self.random_seed = random_seed
+
+        # Set random seed for reproducibility
+        np.random.seed(self.random_seed)
 
         # Read all images and masks
         self.imgs = []
@@ -236,140 +246,69 @@ class SatelliteDataset(Dataset):
             self.imgs.append(img)
             self.masks.append(mask)
 
-        # Set random seed for reproducibility
-        np.random.seed(self.random_seed)
-
-        # Create patches list for all scenes
+        # Initialize patches list
         self.patches = []  # (scene_idx, y, x)
+        
+        # Process each scene
         for scene_idx, (img, mask) in enumerate(zip(self.imgs, self.masks)):
-            print(f"\nProcessing scene {scene_idx}:")
             h, w = img.shape[:2]
             
-            # Делаем размер ячейки в 3-4 раза больше patch_size, кратным stride
-            min_cell_size = 3 * patch_size
-            cell_size = ((min_cell_size + stride - 1) // stride) * stride
+            # Calculate cell size (2 times patch_size)
+            cell_size = 2 * patch_size
             
-            # Вычисляем количество ячеек сетки
-            grid_h = max(2, (h - 1) // cell_size + 1)  # Changed to include partial cells
-            grid_w = max(2, (w - 1) // cell_size + 1)  # Changed to include partial cells
+            # Calculate required padding to make image dimensions divisible by cell_size
+            pad_h = (cell_size - h % cell_size) % cell_size
+            pad_w = (cell_size - w % cell_size) % cell_size
             
-            # Корректируем размер ячейки
-            cell_h = (h - 1) // grid_h + 1  # Changed to include partial cells
-            cell_w = (w - 1) // grid_w + 1  # Changed to include partial cells
-            cell_size_h = ((cell_h + stride - 1) // stride) * stride
-            cell_size_w = ((cell_w + stride - 1) // stride) * stride
+            # Calculate grid dimensions for padded image
+            grid_h = (h + pad_h) // cell_size
+            grid_w = (w + pad_w) // cell_size
             
-            print(f"Grid size: {grid_h}x{grid_w}, Cell size: {cell_size_h}x{cell_size_w}")
-            
-            # Вычисляем плотность зданий для каждой ячейки
-            densities = self._calculate_cell_building_density(mask, cell_size_h, cell_size_w, grid_h, grid_w)
-            
-            # Находим максимальную плотность для нормализации
-            max_density = max(densities.values()) if densities else 0
-            
-            # Разделяем ячейки на группы по плотности
-            cells_by_density = {}
-            for cell, density in densities.items():
-                # Нормализуем плотность и разбиваем на 4 группы
-                if max_density > 0:
-                    normalized_density = density / max_density
-                    group = min(3, int(normalized_density * 4))  # 0: нет/очень мало, 1: мало, 2: средне, 3: много
-                else:
-                    group = 0
-                if group not in cells_by_density:
-                    cells_by_density[group] = []
-                cells_by_density[group].append(cell)
-            
-            # Выводим статистику по группам
-            print("\nCell distribution by density groups:")
-            for group in sorted(cells_by_density.keys()):
-                density_range = [f"{g/4:.1f}-{(g+1)/4:.1f}" for g in [group]][0]
-                print(f"Group {group} (density {density_range}): {len(cells_by_density[group])} cells")
-            
-            # Выбираем тестовые ячейки стратифицированно
-            test_cells = set()
-            n_test_cells = max(2, int(grid_h * grid_w * self.test_ratio))
-            print(f"\nSelecting {n_test_cells} test cells")
-            
-            total_cells = sum(len(cells) for cells in cells_by_density.values())
-            remaining_cells = n_test_cells
-            
-            # Сначала выбираем по одной ячейке из каждой непустой группы
-            for group in sorted(cells_by_density.keys(), reverse=True):  # Начинаем с групп с большей плотностью
-                cells = cells_by_density[group]
-                if not cells or remaining_cells <= 0:
-                    continue
-                
-                # Берем одну ячейку из группы
-                selected_idx = np.random.choice(len(cells))
-                test_cells.add(cells[selected_idx])
-                cells.pop(selected_idx)  # Удаляем выбранную ячейку
-                remaining_cells -= 1
-            
-            # Распределяем оставшиеся ячейки пропорционально размеру групп
-            if remaining_cells > 0:
-                total_remaining = sum(len(cells) for cells in cells_by_density.values())
-                for group in sorted(cells_by_density.keys(), reverse=True):
-                    cells = cells_by_density[group]
-                    if not cells or remaining_cells <= 0:
-                        continue
+            # Calculate building density for each cell
+            densities = {}
+            for i in range(grid_h):
+                for j in range(grid_w):
+                    # Define cell boundaries
+                    y_start = i * cell_size
+                    y_end = min((i + 1) * cell_size, h)  # Don't go beyond original image
+                    x_start = j * cell_size
+                    x_end = min((j + 1) * cell_size, w)  # Don't go beyond original image
                     
-                    n_group_test = max(1, int(len(cells) * remaining_cells / total_remaining))
-                    n_group_test = min(n_group_test, remaining_cells, len(cells))
-                    
-                    if n_group_test > 0:
-                        selected_idx = np.random.choice(len(cells), size=n_group_test, replace=False)
-                        test_cells.update(cells[i] for i in selected_idx)
-                        remaining_cells -= n_group_test
+                    # Calculate density
+                    cell_mask = mask[y_start:y_end, x_start:x_end]
+                    building_pixels = np.sum(cell_mask > 0)
+                    total_pixels = cell_mask.size
+                    density = building_pixels / total_pixels if total_pixels > 0 else 0
+                    densities[(i, j)] = {
+                        'density': density,
+                        'building_pixels': building_pixels,
+                        'total_pixels': total_pixels,
+                        'bounds': (y_start, y_end, x_start, x_end)
+                    }
             
-            print(f"\nTotal selected test cells: {len(test_cells)}")
+            # Assign cells to splits
+            cell_splits = self._assign_cells_to_splits(densities, self.test_ratio, self.test_ratio)
             
-            # Generate patches
-            patches_with_buildings = 0
-            total_patches = 0
-            
-            # Изменено: теперь проходим по всему изображению, включая края
-            for y in range(0, h, self.stride):
-                for x in range(0, w, self.stride):
-                    # Get padded patches to check for buildings
-                    _, _, has_buildings = self._pad_patch(img, mask, y, x, self.patch_size)
+            # Generate patches for the current split
+            if self.split in cell_splits:
+                for cell in cell_splits[self.split]:
+                    cell_info = densities[cell]
+                    y_start, y_end, x_start, x_end = cell_info['bounds']
                     
-                    # Calculate which cell this patch belongs to
-                    patch_corners = [
-                        (y // cell_size_h, x // cell_size_w),
-                        (y // cell_size_h, min((x + patch_size - 1), w - 1) // cell_size_w),
-                        (min((y + patch_size - 1), h - 1) // cell_size_h, x // cell_size_w),
-                        (min((y + patch_size - 1), h - 1) // cell_size_h, min((x + patch_size - 1), w - 1) // cell_size_w)
-                    ]
-                    
-                    corners_in_test = sum(1 for corner in patch_corners if corner in test_cells)
-                    
-                    if split == 'test':
-                        if corners_in_test == len(patch_corners):
-                            self.patches.append((scene_idx, y, x))
-                            total_patches += 1
-                            if has_buildings:
-                                patches_with_buildings += 1
-                    else:  # train/val
-                        if corners_in_test == 0:
-                            self.patches.append((scene_idx, y, x))
-                            total_patches += 1
-                            if has_buildings:
-                                patches_with_buildings += 1
-            
-            print(f"\nPatches statistics for {split} split:")
-            print(f"Total patches: {total_patches}")
-            print(f"Patches with buildings: {patches_with_buildings} ({patches_with_buildings/total_patches*100:.2f}%)")
+                    # Generate patches with stride
+                    for y in range(y_start, y_end - patch_size + 1, stride):
+                        for x in range(x_start, x_end - patch_size + 1, stride):
+                            if y + patch_size <= h and x + patch_size <= w:  # Ensure patch is within original image
+                                self.patches.append((scene_idx, y, x))
 
-        # For train/val split
-        if split != 'test':
-            np.random.shuffle(self.patches)
-            n_total = len(self.patches)
-            n_train = int(n_total * 0.8)
-            if split == 'train':
-                self.patches = self.patches[:n_train]
-            else:  # val
-                self.patches = self.patches[n_train:]
+            print(f"\nScene {scene_idx} Statistics:")
+            print(f"Original size: {h}x{w}")
+            print(f"Padding: {pad_h}x{pad_w}")
+            print(f"Grid size: {grid_h}x{grid_w} cells")
+            for split_name, cells in cell_splits.items():
+                total_building_pixels = sum(densities[cell]['building_pixels'] for cell in cells)
+                print(f"{split_name.capitalize()} cells: {len(cells)}, "
+                      f"Building pixels: {total_building_pixels}")
 
     def _read_rgb(self, scene_dir):
         r = self._read_tif(os.path.join(scene_dir, 'RED.tif'))
@@ -398,12 +337,8 @@ class SatelliteDataset(Dataset):
         scene_idx, y, x = self.patches[idx]
         
         # Get padded patches
-        img_patch, mask_patch, _ = self._pad_patch(
-            self.imgs[scene_idx], 
-            self.masks[scene_idx],
-            y, x, 
-            self.patch_size
-        )
+        img_patch = self.imgs[scene_idx][y:y+self.patch_size, x:x+self.patch_size]
+        mask_patch = self.masks[scene_idx][y:y+self.patch_size, x:x+self.patch_size]
         
         if self.transform:
             augmented = self.transform(image=img_patch, mask=mask_patch)
@@ -418,6 +353,146 @@ class SatelliteDataset(Dataset):
             mask_patch = mask_patch.unsqueeze(0)
         
         return {'img': img_patch, 'mask': mask_patch, 'coords': (scene_idx, y, x)}
+
+    def visualize_split(self, scene_idx=0):
+        """Visualize dataset split for a given scene.
+        
+        Args:
+            scene_idx (int): Index of scene to visualize
+        """
+        # Get original image and mask
+        img = self.imgs[scene_idx]
+        mask = self.masks[scene_idx]
+        h, w = img.shape[:2]
+        
+        # Calculate cell size and padding
+        cell_size = 2 * self.patch_size
+        pad_h = (cell_size - h % cell_size) % cell_size
+        pad_w = (cell_size - w % cell_size) % cell_size
+        
+        # Create padded image and mask
+        padded_h = h + pad_h
+        padded_w = w + pad_w
+        padded_img = np.zeros((padded_h, padded_w, 3), dtype=img.dtype)
+        padded_mask = np.zeros((padded_h, padded_w), dtype=mask.dtype)
+        padded_img[:h, :w] = img
+        padded_mask[:h, :w] = mask
+        
+        # Calculate grid dimensions
+        grid_h = padded_h // cell_size
+        grid_w = padded_w // cell_size
+        
+        # Create visualization
+        plt.figure(figsize=(20, 10))
+        
+        # Plot padded image with patches
+        plt.subplot(1, 2, 1)
+        plt.imshow(padded_img)
+        plt.title('Patch Distribution (with padding)')
+        
+        # Draw grid lines for cells
+        for i in range(grid_h + 1):
+            y = i * cell_size
+            plt.axhline(y=y, color='white', linestyle='--', alpha=0.3)
+        for j in range(grid_w + 1):
+            x = j * cell_size
+            plt.axvline(x=x, color='white', linestyle='--', alpha=0.3)
+
+        # Colors for visualization
+        colors = {
+            'train': 'blue',
+            'val': 'red',
+            'test': 'yellow'
+        }
+        
+        # Calculate densities and assign cells to splits
+        densities = {}
+        for i in range(grid_h):
+            for j in range(grid_w):
+                # Define cell boundaries
+                y_start = i * cell_size
+                y_end = min((i + 1) * cell_size, padded_h)
+                x_start = j * cell_size
+                x_end = min((j + 1) * cell_size, padded_w)
+                
+                # Calculate density (only for the non-padded part of the cell)
+                cell_mask = mask[max(0, min(h, y_start)):max(0, min(h, y_end)),
+                               max(0, min(w, x_start)):max(0, min(w, x_end))]
+                building_pixels = np.sum(cell_mask > 0)
+                total_pixels = cell_mask.size
+                density = building_pixels / total_pixels if total_pixels > 0 else 0
+                densities[(i, j)] = {
+                    'density': density,
+                    'building_pixels': building_pixels,
+                    'total_pixels': total_pixels,
+                    'bounds': (y_start, y_end, x_start, x_end)
+                }
+        
+        # Assign cells to splits
+        cell_splits = self._assign_cells_to_splits(densities, self.test_ratio, self.test_ratio)
+        
+        # Draw patches for each split
+        for split_name, cells in cell_splits.items():
+            line_width = 3 if split_name == 'test' else (2 if split_name == 'val' else 1)
+            for cell in cells:
+                y_start, y_end, x_start, x_end = densities[cell]['bounds']
+                
+                # Draw all possible patches within the cell
+                for y in range(y_start, y_end - self.patch_size + 1, self.stride):
+                    for x in range(x_start, x_end - self.patch_size + 1, self.stride):
+                        rect = plt.Rectangle(
+                            (x, y), self.patch_size, self.patch_size,
+                            linewidth=line_width,
+                            edgecolor=colors[split_name],
+                            facecolor='none',
+                            alpha=1.0
+                        )
+                        plt.gca().add_patch(rect)
+        
+        # Add legend
+        legend_elements = [
+            plt.Rectangle((0, 0), 1, 1, facecolor='none', edgecolor='blue', linewidth=1, label='Train'),
+            plt.Rectangle((0, 0), 1, 1, facecolor='none', edgecolor='red', linewidth=2, label='Val'),
+            plt.Rectangle((0, 0), 1, 1, facecolor='none', edgecolor='yellow', linewidth=3, label='Test')
+        ]
+        plt.legend(handles=legend_elements, loc='upper right')
+        plt.axis('off')
+        
+        # Plot padded building mask with grid
+        plt.subplot(1, 2, 2)
+        plt.imshow(padded_mask, cmap='gray')
+        plt.title('Building Mask with Grid (padded)')
+        
+        # Draw grid lines
+        for i in range(grid_h + 1):
+            y = i * cell_size
+            plt.axhline(y=y, color='red', linestyle='--', alpha=0.3)
+        for j in range(grid_w + 1):
+            x = j * cell_size
+            plt.axvline(x=x, color='red', linestyle='--', alpha=0.3)
+        plt.axis('off')
+        
+        plt.suptitle(f'Scene {scene_idx} - Split Distribution and Building Mask', fontsize=16)
+        plt.tight_layout()
+        plt.show()
+        
+        # Print statistics
+        print(f"\nScene {scene_idx} Statistics:")
+        print(f"Original size: {h}x{w}")
+        print(f"Padded size: {padded_h}x{padded_w} (padding: {pad_h}x{pad_w})")
+        print(f"Grid size: {grid_h}x{grid_w} cells")
+        print(f"Cell size: {cell_size}x{cell_size} pixels")
+        print(f"Patch size: {self.patch_size}x{self.patch_size} pixels")
+        print(f"Stride: {self.stride} pixels")
+        
+        for split_name, cells in cell_splits.items():
+            total_building_pixels = sum(densities[cell]['building_pixels'] for cell in cells)
+            total_pixels = sum(densities[cell]['total_pixels'] for cell in cells)
+            density = total_building_pixels / total_pixels if total_pixels > 0 else 0
+            print(f"\n{split_name.capitalize()}:")
+            print(f"  Cells: {len(cells)}")
+            print(f"  Building pixels: {total_building_pixels}")
+            print(f"  Building density: {density*100:.1f}%")
 
 ########################################################
 # LOSS
@@ -729,114 +804,11 @@ def denormalize(tensor, mean=MEAN, std=STD):
         t.mul_(s).add_(m)
     return result
 
-def visualize_splits_overlap(train_dataset, val_dataset, test_dataset, scene_idx=0):
-    """Visualize patches from all splits on one image to check for overlaps.
-    
-    Args:
-        train_dataset (SatelliteDataset): Training dataset
-        val_dataset (SatelliteDataset): Validation dataset
-        test_dataset (SatelliteDataset): Test dataset
-        scene_idx (int): Index of scene to visualize
-    """
-    # Get original image and mask
-    img = train_dataset.imgs[scene_idx]
-    mask = train_dataset.masks[scene_idx]
-    patch_size = train_dataset.patch_size
-    
-    # Create visualization
-    plt.figure(figsize=(20, 10))
-    
-    # Plot original image with patches
-    plt.subplot(1, 2, 1)
-    plt.imshow(img)
-    plt.title('Patch Distribution')
-    
-    # Draw grid
-    h, w = img.shape[:2]
-    min_cell_size = 3 * patch_size
-    cell_size = ((min_cell_size + train_dataset.stride - 1) // train_dataset.stride) * train_dataset.stride
-    grid_h = max(2, (h - patch_size) // cell_size + 1)
-    grid_w = max(2, (w - patch_size) // cell_size + 1)
-    cell_h = (h - patch_size) // grid_h + 1
-    cell_w = (w - patch_size) // grid_w + 1
-    cell_size_h = ((cell_h + train_dataset.stride - 1) // train_dataset.stride) * train_dataset.stride
-    cell_size_w = ((cell_w + train_dataset.stride - 1) // train_dataset.stride) * train_dataset.stride
-    
-    # Draw grid lines
-    for i in range(grid_h + 1):
-        y = i * cell_size_h
-        plt.axhline(y=y, color='white', linestyle='--', alpha=0.3)
-    for j in range(grid_w + 1):
-        x = j * cell_size_w
-        plt.axvline(x=x, color='white', linestyle='--', alpha=0.3)
-    
-    # Colors for visualization
-    colors = {
-        'train': 'blue',
-        'val': 'red',
-        'test': 'yellow'
-    }
-    
-    # Draw patches in order: test (3px) -> val (2px) -> train (1px)
-    for split_name, dataset, line_width in [
-        ('test', test_dataset, 3),
-        ('val', val_dataset, 2), 
-        ('train', train_dataset, 1)
-    ]:
-        for scene_i, y, x in dataset.patches:
-            if scene_i == scene_idx:
-                rect = plt.Rectangle(
-                    (x, y), patch_size, patch_size,
-                    linewidth=line_width,
-                    edgecolor=colors[split_name],
-                    facecolor='none',
-                    alpha=1.0
-                )
-                plt.gca().add_patch(rect)
-    
-    # Add legend
-    legend_elements = [
-        plt.Rectangle((0, 0), 1, 1, facecolor='none', edgecolor='blue', linewidth=1, label='Train'),
-        plt.Rectangle((0, 0), 1, 1, facecolor='none', edgecolor='red', linewidth=2, label='Val'),
-        plt.Rectangle((0, 0), 1, 1, facecolor='none', edgecolor='yellow', linewidth=3, label='Test')
-    ]
-    plt.legend(handles=legend_elements, loc='upper right')
-    plt.axis('off')
-    
-    # Plot building mask with grid
-    plt.subplot(1, 2, 2)
-    plt.imshow(mask, cmap='gray')
-    plt.title('Building Mask with Grid')
-    
-    # Draw grid lines
-    for i in range(grid_h + 1):
-        y = i * cell_size_h
-        plt.axhline(y=y, color='red', linestyle='--', alpha=0.3)
-    for j in range(grid_w + 1):
-        x = j * cell_size_w
-        plt.axvline(x=x, color='red', linestyle='--', alpha=0.3)
-    plt.axis('off')
-    
-    plt.suptitle(f'Scene {scene_idx} - Split Distribution and Building Mask', fontsize=16)
-    plt.tight_layout()
-    plt.show()
-    
-    # Print statistics
-    print(f"\nScene {scene_idx} Statistics:")
-    train_patches = sum(1 for p in train_dataset.patches if p[0] == scene_idx)
-    val_patches = sum(1 for p in val_dataset.patches if p[0] == scene_idx)
-    test_patches = sum(1 for p in test_dataset.patches if p[0] == scene_idx)
-    total_patches = train_patches + val_patches + test_patches
-    
-    print(f"Train patches: {train_patches} ({train_patches/total_patches*100:.1f}%)")
-    print(f"Val patches: {val_patches} ({val_patches/total_patches*100:.1f}%)")
-    print(f"Test patches: {test_patches} ({test_patches/total_patches*100:.1f}%)")
-    print(f"Total patches: {total_patches}")
 
 # Analyze each scene
-print("\nChecking for overlaps between splits...")
+print("\nChecking splits for each scene...")
 for scene_idx in range(len(train_dataset.root_dirs)):
-    visualize_splits_overlap(train_dataset, val_dataset, test_dataset, scene_idx)
+    train_dataset.visualize_split(scene_idx)
 
 
 # Функция для визуализации батча
