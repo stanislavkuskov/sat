@@ -687,6 +687,132 @@ def denormalize(tensor, mean=MEAN, std=STD):
         t.mul_(s).add_(m)
     return result
 
+def visualize_splits_overlap(train_dataset, val_dataset, test_dataset, scene_idx=0):
+    """Visualize patches from all splits on one image to check for overlaps.
+    
+    Args:
+        train_dataset (SatelliteDataset): Training dataset
+        val_dataset (SatelliteDataset): Validation dataset
+        test_dataset (SatelliteDataset): Test dataset
+        scene_idx (int): Index of scene to visualize
+    """
+    # Get original image and mask
+    img = train_dataset.imgs[scene_idx]
+    mask = train_dataset.masks[scene_idx]
+    patch_size = train_dataset.patch_size
+    
+    # Create visualization
+    plt.figure(figsize=(20, 10))
+    
+    # Plot original image with patches
+    plt.subplot(1, 2, 1)
+    plt.imshow(img)
+    plt.title('Patch Distribution')
+    
+    # Draw grid
+    h, w = img.shape[:2]
+    min_cell_size = 3 * patch_size
+    cell_size = ((min_cell_size + train_dataset.stride - 1) // train_dataset.stride) * train_dataset.stride
+    grid_h = max(2, (h - patch_size) // cell_size + 1)
+    grid_w = max(2, (w - patch_size) // cell_size + 1)
+    cell_h = (h - patch_size) // grid_h + 1
+    cell_w = (w - patch_size) // grid_w + 1
+    cell_size_h = ((cell_h + train_dataset.stride - 1) // train_dataset.stride) * train_dataset.stride
+    cell_size_w = ((cell_w + train_dataset.stride - 1) // train_dataset.stride) * train_dataset.stride
+    
+    # Draw grid lines
+    for i in range(grid_h + 1):
+        y = i * cell_size_h
+        plt.axhline(y=y, color='white', linestyle='--', alpha=0.3)
+    for j in range(grid_w + 1):
+        x = j * cell_size_w
+        plt.axvline(x=x, color='white', linestyle='--', alpha=0.3)
+    
+    # Draw patches for each split with different colors and styles
+    colors = {
+        'train': ('blue', 0.3),
+        'val': ('red', 0.3),
+        'test': ('yellow', 0.3)
+    }
+    
+    # Draw test patches first (they will be at the bottom)
+    for scene_i, y, x in test_dataset.patches:
+        if scene_i == scene_idx:
+            rect = patches.Rectangle(
+                (x, y), patch_size, patch_size,
+                linewidth=2, edgecolor=colors['test'][0], 
+                facecolor='none',
+                alpha=1.0
+            )
+            plt.gca().add_patch(rect)
+    
+    # Then validation patches
+    for scene_i, y, x in val_dataset.patches:
+        if scene_i == scene_idx:
+            rect = patches.Rectangle(
+                (x, y), patch_size, patch_size,
+                linewidth=2, edgecolor=colors['val'][0], 
+                facecolor='none',
+                alpha=1.0
+            )
+            plt.gca().add_patch(rect)
+    
+    # Finally train patches (they will be on top)
+    for scene_i, y, x in train_dataset.patches:
+        if scene_i == scene_idx:
+            rect = patches.Rectangle(
+                (x, y), patch_size, patch_size,
+                linewidth=2, edgecolor=colors['train'][0], 
+                facecolor='none',
+                alpha=1.0
+            )
+            plt.gca().add_patch(rect)
+    
+    # Add legend
+    legend_elements = [
+        patches.Patch(facecolor='none', edgecolor='blue', label='Train'),
+        patches.Patch(facecolor='none', edgecolor='red', label='Val'),
+        patches.Patch(facecolor='none', edgecolor='yellow', label='Test')
+    ]
+    plt.legend(handles=legend_elements, loc='upper right')
+    plt.axis('off')
+    
+    # Plot building mask with grid
+    plt.subplot(1, 2, 2)
+    plt.imshow(mask, cmap='gray')
+    plt.title('Building Mask with Grid')
+    
+    # Draw grid lines
+    for i in range(grid_h + 1):
+        y = i * cell_size_h
+        plt.axhline(y=y, color='red', linestyle='--', alpha=0.3)
+    for j in range(grid_w + 1):
+        x = j * cell_size_w
+        plt.axvline(x=x, color='red', linestyle='--', alpha=0.3)
+    plt.axis('off')
+    
+    plt.suptitle(f'Scene {scene_idx} - Split Distribution and Building Mask', fontsize=16)
+    plt.tight_layout()
+    plt.show()
+    
+    # Print statistics
+    print(f"\nScene {scene_idx} Statistics:")
+    train_patches = sum(1 for p in train_dataset.patches if p[0] == scene_idx)
+    val_patches = sum(1 for p in val_dataset.patches if p[0] == scene_idx)
+    test_patches = sum(1 for p in test_dataset.patches if p[0] == scene_idx)
+    total_patches = train_patches + val_patches + test_patches
+    
+    print(f"Train patches: {train_patches} ({train_patches/total_patches*100:.1f}%)")
+    print(f"Val patches: {val_patches} ({val_patches/total_patches*100:.1f}%)")
+    print(f"Test patches: {test_patches} ({test_patches/total_patches*100:.1f}%)")
+    print(f"Total patches: {total_patches}")
+
+# Analyze each scene
+print("\nChecking for overlaps between splits...")
+for scene_idx in range(len(train_dataset.root_dirs)):
+    visualize_splits_overlap(train_dataset, val_dataset, test_dataset, scene_idx)
+
+
 # Функция для визуализации батча
 def visualize_batch(loader, title):
     """Visualize a batch of training data.
@@ -1058,73 +1184,3 @@ for metric_name, value in test_metrics.items():
 visualize_predictions(model, test_loader, DEVICE)
 
 writer.close()
-
-def visualize_split_distribution(dataset, scene_idx=0):
-    """Visualize the train/val/test split distribution for a scene.
-
-    This function creates a visualization showing how patches are distributed
-    across different splits in the dataset for a given scene.
-
-    Args:
-        dataset (SatelliteDataset): Dataset instance to visualize
-        scene_idx (int, optional): Index of the scene to visualize. Defaults to 0.
-
-    Returns:
-        None
-    """
-    img = dataset.imgs[scene_idx]
-    h, w = img.shape[:2]
-    patch_size = dataset.patch_size
-    
-    # Вычисляем параметры сетки как в __init__
-    min_cell_size = 3 * patch_size
-    cell_size = ((min_cell_size + dataset.stride - 1) // dataset.stride) * dataset.stride
-    grid_h = max(2, (h - patch_size) // cell_size + 1)
-    grid_w = max(2, (w - patch_size) // cell_size + 1)
-    cell_h = (h - patch_size) // grid_h + 1
-    cell_w = (w - patch_size) // grid_w + 1
-    cell_size_h = ((cell_h + dataset.stride - 1) // dataset.stride) * dataset.stride
-    cell_size_w = ((cell_w + dataset.stride - 1) // dataset.stride) * dataset.stride
-    
-    # Создаем фигуру
-    plt.figure(figsize=(15, 15))
-    plt.imshow(img)
-    
-    # Отрисовываем сетку
-    for i in range(grid_h + 1):
-        y = i * cell_size_h
-        plt.axhline(y=y, color='white', linestyle='--', alpha=0.5)
-    for j in range(grid_w + 1):
-        x = j * cell_size_w
-        plt.axvline(x=x, color='white', linestyle='--', alpha=0.5)
-    
-    # Отмечаем тестовые ячейки
-    np.random.seed(dataset.random_seed)
-    all_cells = [(i, j) for i in range(grid_h) for j in range(grid_w)]
-    np.random.shuffle(all_cells)
-    n_test_cells = max(2, int(len(all_cells) * dataset.test_ratio))
-    test_cells = set(all_cells[:n_test_cells])
-    
-    for i, j in test_cells:
-        rect = patches.Rectangle(
-            (j * cell_size_w, i * cell_size_h),
-            cell_size_w, cell_size_h,
-            linewidth=2, edgecolor='red', facecolor='red', alpha=0.2
-        )
-        plt.gca().add_patch(rect)
-    
-    # Отмечаем патчи
-    for scene_i, y, x in dataset.patches:
-        if scene_i == scene_idx:
-            color = 'blue' if dataset.split != 'test' else 'yellow'
-            rect = patches.Rectangle(
-                (x, y), patch_size, patch_size,
-                linewidth=1, edgecolor=color, facecolor='none'
-            )
-            plt.gca().add_patch(rect)
-    
-    plt.title(f'Scene {scene_idx} - {dataset.split} split\nRed regions: test cells, '
-              f'{"Yellow" if dataset.split == "test" else "Blue"} boxes: patches')
-    plt.axis('off')
-    plt.show()
-
