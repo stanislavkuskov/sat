@@ -18,8 +18,9 @@ import torch.nn.functional as F
 import matplotlib.patches as patches
 import random
 import cv2
+from torch.cuda.amp import GradScaler
+from torch.amp import autocast
 
-# Set random seed for reproducibility
 SEED = 42
 torch.manual_seed(SEED)
 torch.cuda.manual_seed_all(SEED)
@@ -32,6 +33,7 @@ DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 MEAN = (0.485, 0.456, 0.406)
 STD = (0.229, 0.224, 0.225)
+
 
 ########################################################
 # MODEL
@@ -281,33 +283,9 @@ class SatelliteDataset(Dataset):
         
         return {'img': img_patch, 'mask': mask_patch, 'coords': (scene_idx, y, x)}
 
-# ---- Boundary Loss ----
-def boundary_map(mask):
-    """Compute boundary map from binary segmentation mask.
-
-    This function calculates a boundary map by applying morphological operations
-    to detect edges in the binary segmentation mask.
-
-    Args:
-        mask (torch.Tensor): Binary segmentation mask tensor
-
-    Returns:
-        torch.Tensor: Boundary map tensor with same shape as input mask
-    """
-    # Переводим в numpy и расширяем диапазон до 0-255
-    mask_np = (mask.cpu().numpy() * 255).astype(np.uint8)
-    
-    edge_maps = []
-    for m in mask_np:
-        # Применяем размытие перед детектором границ для лучшего результата
-        blurred = cv2.GaussianBlur(m[0], (3, 3), 0)
-        # Используем более низкие пороги для Canny, так как у нас бинарная маска
-        edge = cv2.Canny(blurred, 30, 100)
-        # Нормализуем обратно к 0-1
-        edge_maps.append(edge / 255.)
-    
-    edge_maps = np.stack(edge_maps)
-    return torch.from_numpy(edge_maps).float().unsqueeze(1).to(mask.device)
+########################################################
+# LOSS
+########################################################
 
 class ConditionalBoundaryLoss(torch.nn.Module):
     """Boundary-aware loss function for semantic segmentation.
@@ -330,6 +308,33 @@ class ConditionalBoundaryLoss(torch.nn.Module):
         self.theta = theta
         self.window_size = window_size
         self.pool = torch.nn.AvgPool2d(window_size, stride=1, padding=window_size//2)
+
+    def _boundary_map(self, mask):
+        """Compute boundary map from binary segmentation mask.
+
+        This function calculates a boundary map by applying morphological operations
+        to detect edges in the binary segmentation mask.
+
+        Args:
+            mask (torch.Tensor): Binary segmentation mask tensor
+
+        Returns:
+            torch.Tensor: Boundary map tensor with same shape as input mask
+        """
+        # Переводим в numpy и расширяем диапазон до 0-255
+        mask_np = (mask.cpu().numpy() * 255).astype(np.uint8)
+        
+        edge_maps = []
+        for m in mask_np:
+            # Применяем размытие перед детектором границ для лучшего результата
+            blurred = cv2.GaussianBlur(m[0], (3, 3), 0)
+            # Используем более низкие пороги для Canny, так как у нас бинарная маска
+            edge = cv2.Canny(blurred, 30, 100)
+            # Нормализуем обратно к 0-1
+            edge_maps.append(edge / 255.)
+        
+        edge_maps = np.stack(edge_maps)
+        return torch.from_numpy(edge_maps).float().unsqueeze(1).to(mask.device)
     
     def forward(self, pred, target):
         """Compute the boundary-aware loss.
@@ -345,7 +350,7 @@ class ConditionalBoundaryLoss(torch.nn.Module):
         pred_prob = torch.sigmoid(pred)
         
         # Получаем границы из целевой маски
-        target_edges = boundary_map(target)
+        target_edges = self._boundary_map(target)
         
         # Вычисляем локальную неопределенность
         local_uncertainty = -pred_prob * torch.log(pred_prob + 1e-6) - \
@@ -450,11 +455,9 @@ def visualize_predictions(model, loader, device, num_samples=4):
             if i >= num_samples:
                 break
                 
-            # Process one image at a time to save memory
             images = batch['img'][0:1].to(device)  # Take only one image
             masks = batch['mask'][0:1]  # Take only one image
             
-            # Убедимся, что маски имеют правильную размерность
             if masks.ndim == 3:
                 masks = masks.unsqueeze(1)
             
@@ -489,10 +492,11 @@ def visualize_predictions(model, loader, device, num_samples=4):
     plt.close()
 
 
-# Пути к вашим сценам
-data_dirs = ["data/ventura", "data/santa_rosa"]
+########################################################
+# DATA
+########################################################
 
-# Значения для нормализации/денормализации для диапазона 0-255
+data_dirs = ["data/ventura", "data/santa_rosa"]
 
 val_transform = A.Compose([
     A.Normalize(mean=MEAN, std=STD),
@@ -516,7 +520,7 @@ train_transform = A.Compose([
 
 patch_size = 224
 stride = 32
-# Создаем датасеты для train, val и test
+
 train_dataset = SatelliteDataset(
     root_dirs=data_dirs,
     patch_size=patch_size,
@@ -547,14 +551,13 @@ test_dataset = SatelliteDataset(
     random_seed=SEED
 )
 
-# Создаем DataLoader для каждого датасета
-batch_size = 32
+batch_size = 64
 
 train_loader = DataLoader(
     dataset=train_dataset,
     batch_size=batch_size,
     shuffle=True,
-    num_workers=0,  # Changed from 4 to 0
+    num_workers=0,
     pin_memory=True
 )
 
@@ -562,7 +565,7 @@ val_loader = DataLoader(
     dataset=val_dataset,
     batch_size=batch_size,
     shuffle=False,
-    num_workers=0,  # Changed from 1 to 0
+    num_workers=0,
     pin_memory=True
 )
 
@@ -570,11 +573,11 @@ test_loader = DataLoader(
     dataset=test_dataset,
     batch_size=batch_size,
     shuffle=False,
-    num_workers=0,  # Changed from 1 to 0
+    num_workers=0,
     pin_memory=True
 )
 
-# Функция денормализации для визуализации
+# Denorm for visualization
 def denormalize(tensor, mean=MEAN, std=STD):
     """Denormalize an image tensor to original scale.
 
@@ -646,7 +649,6 @@ def visualize_batch(loader, title):
     plt.tight_layout()
     plt.show()
     
-    # Статистика
     building_pixels = (masks == 1).sum().item()
     total_pixels = masks.numel()
     building_percent = building_pixels / total_pixels * 100
@@ -702,11 +704,11 @@ metrics = [
     smp.metrics.recall,
 ]
 
-def train_epoch(model, loader, optimizer, criterion, device):
+def train_epoch(model, loader, optimizer, criterion, device, scaler):
     """Train the model for one epoch.
 
     This function performs one training epoch, iterating over all batches
-    in the data loader and updating model parameters.
+    in the data loader and updating model parameters using mixed precision training.
 
     Args:
         model (torch.nn.Module): Model to train
@@ -714,6 +716,7 @@ def train_epoch(model, loader, optimizer, criterion, device):
         optimizer (torch.optim.Optimizer): Optimizer for parameter updates
         criterion (torch.nn.Module): Loss function
         device (torch.device): Device to run training on
+        scaler (GradScaler): Gradient scaler for mixed precision training
 
     Returns:
         float: Average training loss for the epoch
@@ -726,11 +729,20 @@ def train_epoch(model, loader, optimizer, criterion, device):
         masks = batch['mask'].to(device)
         
         optimizer.zero_grad()
-        outputs = model(images)
-        loss = criterion(outputs, masks)
         
-        loss.backward()
-        optimizer.step()
+        # Automatic mixed precision
+        with autocast('cuda'):
+            outputs = model(images)
+            loss = criterion(outputs, masks)
+        
+        # Scale loss and call backward()
+        scaler.scale(loss).backward()
+        
+        # Unscale gradients and call/skip optimizer.step()
+        scaler.step(optimizer)
+        
+        # Update scaler for next iteration
+        scaler.update()
         
         total_loss += loss.item()
     
@@ -741,6 +753,7 @@ def validate(model, loader, criterion, metrics, device, writer, epoch):
 
     This function evaluates the model performance on the validation set,
     computing various metrics and logging results to TensorBoard.
+    Uses mixed precision for faster evaluation.
 
     Args:
         model (torch.nn.Module): Model to evaluate
@@ -773,7 +786,7 @@ def validate(model, loader, criterion, metrics, device, writer, epoch):
     tn_thresholds = torch.zeros(n_thresholds, device=device)
     fn_thresholds = torch.zeros(n_thresholds, device=device)
     
-    with torch.no_grad():
+    with torch.no_grad(), autocast('cuda'):
         for i, batch in enumerate(tqdm(loader)):
             images = batch['img'].to(device)
             masks = batch['mask'].to(device)
@@ -826,7 +839,7 @@ def validate(model, loader, criterion, metrics, device, writer, epoch):
             # Очищаем память
             del outputs, prob_mask, pred_mask
             torch.cuda.empty_cache()
-    
+
     # Вычисляем ROC и PR кривые из накопленной статистики
     tpr = tp_thresholds / (tp_thresholds + fn_thresholds + 1e-7)
     fpr = fp_thresholds / (fp_thresholds + tn_thresholds + 1e-7)
@@ -896,7 +909,7 @@ def validate(model, loader, criterion, metrics, device, writer, epoch):
     
     return total_loss / len(loader), metric_values
 
-num_epochs = 100
+num_epochs = 1000
 best_val_iou = 0.0  # Изменяем с loss на IoU
 patience = 10
 patience_counter = 0
@@ -905,8 +918,11 @@ epoch = 0
 exp_name = f"runs/segmentation_experiment_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
 writer = SummaryWriter(log_dir=exp_name)
 
+# Initialize gradient scaler for mixed precision training
+scaler = GradScaler()
+
 for epoch in range(num_epochs):
-    train_loss = train_epoch(model, train_loader, optimizer, criterion, DEVICE)
+    train_loss = train_epoch(model, train_loader, optimizer, criterion, DEVICE, scaler)
     val_loss, val_metrics = validate(model, val_loader, criterion, metrics, DEVICE, writer, epoch)
     
     writer.add_scalar('Loss/train', train_loss, epoch)
