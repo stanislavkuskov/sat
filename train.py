@@ -18,8 +18,7 @@ import torch.nn.functional as F
 import matplotlib.patches as patches
 import random
 import cv2
-from torch.cuda.amp import GradScaler
-from torch.amp import autocast
+from torch.amp import GradScaler, autocast
 
 SEED = 42
 torch.manual_seed(SEED)
@@ -141,6 +140,30 @@ class SatelliteDataset(Dataset):
         test_ratio (float, optional): Ratio of data to use for test set. Defaults to 0.1.
         random_seed (int, optional): Random seed for reproducibility. Defaults to 42.
     """
+    def _calculate_cell_building_density(self, mask, cell_size_h, cell_size_w, grid_h, grid_w):
+        """Вычисляет плотность зданий для каждой ячейки сетки."""
+        densities = {}
+        for i in range(grid_h):
+            for j in range(grid_w):
+                # Определяем границы ячейки
+                y_start = i * cell_size_h
+                y_end = min((i + 1) * cell_size_h, mask.shape[0])
+                x_start = j * cell_size_w
+                x_end = min((j + 1) * cell_size_w, mask.shape[1])
+                
+                # Вычисляем плотность зданий в ячейке
+                cell_mask = mask[y_start:y_end, x_start:x_end]
+                building_pixels = np.sum(cell_mask > 0)
+                total_pixels = cell_mask.size
+                density = building_pixels / total_pixels if total_pixels > 0 else 0
+                densities[(i, j)] = density
+                
+                # Отладочный вывод для проверки плотности
+                if building_pixels > 0:
+                    print(f"Cell ({i},{j}) has density {density:.3f} ({building_pixels}/{total_pixels} pixels)")
+        
+        return densities
+
     def __init__(self, 
                  root_dirs, 
                  patch_size=512, 
@@ -183,7 +206,8 @@ class SatelliteDataset(Dataset):
 
         # Create patches list for all scenes
         self.patches = []  # (scene_idx, y, x)
-        for scene_idx, img in enumerate(self.imgs):
+        for scene_idx, (img, mask) in enumerate(zip(self.imgs, self.masks)):
+            print(f"\nProcessing scene {scene_idx}:")
             h, w = img.shape[:2]
             
             # Делаем размер ячейки в 3-4 раза больше patch_size, кратным stride
@@ -191,55 +215,125 @@ class SatelliteDataset(Dataset):
             cell_size = ((min_cell_size + stride - 1) // stride) * stride
             
             # Вычисляем количество ячеек сетки
-            grid_h = max(2, (h - patch_size) // cell_size + 1)  # минимум 2x2 сетка
+            grid_h = max(2, (h - patch_size) // cell_size + 1)
             grid_w = max(2, (w - patch_size) // cell_size + 1)
             
-            # Корректируем размер ячейки, чтобы равномерно покрыть изображение
+            # Корректируем размер ячейки
             cell_h = (h - patch_size) // grid_h + 1
             cell_w = (w - patch_size) // grid_w + 1
-            # Округляем до кратного stride
             cell_size_h = ((cell_h + stride - 1) // stride) * stride
             cell_size_w = ((cell_w + stride - 1) // stride) * stride
             
-            # Randomly select grid cells for test set
-            n_cells = grid_h * grid_w
-            n_test_cells = max(2, int(n_cells * self.test_ratio))  # минимум 2 ячейки для теста
-            all_cells = [(i, j) for i in range(grid_h) for j in range(grid_w)]
-            np.random.shuffle(all_cells)
-            test_cells = set(all_cells[:n_test_cells])
+            print(f"Grid size: {grid_h}x{grid_w}, Cell size: {cell_size_h}x{cell_size_w}")
             
-            # Generate patches based on split
+            # Вычисляем плотность зданий для каждой ячейки
+            densities = self._calculate_cell_building_density(mask, cell_size_h, cell_size_w, grid_h, grid_w)
+            
+            # Находим максимальную плотность для нормализации
+            max_density = max(densities.values()) if densities else 0
+            
+            # Разделяем ячейки на группы по плотности
+            cells_by_density = {}
+            for cell, density in densities.items():
+                # Нормализуем плотность и разбиваем на 4 группы
+                if max_density > 0:
+                    normalized_density = density / max_density
+                    group = min(3, int(normalized_density * 4))  # 0: нет/очень мало, 1: мало, 2: средне, 3: много
+                else:
+                    group = 0
+                if group not in cells_by_density:
+                    cells_by_density[group] = []
+                cells_by_density[group].append(cell)
+            
+            # Выводим статистику по группам
+            print("\nCell distribution by density groups:")
+            for group in sorted(cells_by_density.keys()):
+                density_range = [f"{g/4:.1f}-{(g+1)/4:.1f}" for g in [group]][0]
+                print(f"Group {group} (density {density_range}): {len(cells_by_density[group])} cells")
+            
+            # Выбираем тестовые ячейки стратифицированно
+            test_cells = set()
+            n_test_cells = max(2, int(grid_h * grid_w * self.test_ratio))
+            print(f"\nSelecting {n_test_cells} test cells")
+            
+            total_cells = sum(len(cells) for cells in cells_by_density.values())
+            remaining_cells = n_test_cells
+            
+            # Сначала выбираем по одной ячейке из каждой непустой группы
+            for group in sorted(cells_by_density.keys(), reverse=True):  # Начинаем с групп с большей плотностью
+                cells = cells_by_density[group]
+                if not cells or remaining_cells <= 0:
+                    continue
+                
+                # Берем одну ячейку из группы
+                selected_idx = np.random.choice(len(cells))
+                test_cells.add(cells[selected_idx])
+                cells.pop(selected_idx)  # Удаляем выбранную ячейку
+                remaining_cells -= 1
+            
+            # Распределяем оставшиеся ячейки пропорционально размеру групп
+            if remaining_cells > 0:
+                total_remaining = sum(len(cells) for cells in cells_by_density.values())
+                for group in sorted(cells_by_density.keys(), reverse=True):
+                    cells = cells_by_density[group]
+                    if not cells or remaining_cells <= 0:
+                        continue
+                    
+                    n_group_test = max(1, int(len(cells) * remaining_cells / total_remaining))
+                    n_group_test = min(n_group_test, remaining_cells, len(cells))
+                    
+                    if n_group_test > 0:
+                        selected_idx = np.random.choice(len(cells), size=n_group_test, replace=False)
+                        test_cells.update(cells[i] for i in selected_idx)
+                        remaining_cells -= n_group_test
+            
+            print(f"\nTotal selected test cells: {len(test_cells)}")
+            
+            # Generate patches
+            patches_with_buildings = 0
+            total_patches = 0
+            
             for y in range(0, h - self.patch_size + 1, self.stride):
                 for x in range(0, w - self.patch_size + 1, self.stride):
-                    # Проверяем все четыре угла патча
                     patch_corners = [
-                        (y // cell_size_h, x // cell_size_w),  # верхний левый
-                        (y // cell_size_h, (x + patch_size - 1) // cell_size_w),  # верхний правый
-                        ((y + patch_size - 1) // cell_size_h, x // cell_size_w),  # нижний левый
-                        ((y + patch_size - 1) // cell_size_h, (x + patch_size - 1) // cell_size_w)  # нижний правый
+                        (y // cell_size_h, x // cell_size_w),
+                        (y // cell_size_h, (x + patch_size - 1) // cell_size_w),
+                        ((y + patch_size - 1) // cell_size_h, x // cell_size_w),
+                        ((y + patch_size - 1) // cell_size_h, (x + patch_size - 1) // cell_size_w)
                     ]
                     
-                    # Проверяем, все ли углы патча находятся в одном типе ячеек (тест или не тест)
                     corners_in_test = sum(1 for corner in patch_corners if corner in test_cells)
                     
+                    # Проверяем наличие зданий в патче
+                    patch_mask = mask[y:y+patch_size, x:x+patch_size]
+                    has_buildings = np.any(patch_mask > 0)
+                    
                     if split == 'test':
-                        # Для тестового набора все углы должны быть в тестовых ячейках
                         if corners_in_test == len(patch_corners):
                             self.patches.append((scene_idx, y, x))
+                            total_patches += 1
+                            if has_buildings:
+                                patches_with_buildings += 1
                     else:  # train/val
-                        # Для train/val ни один угол не должен быть в тестовых ячейках
                         if corners_in_test == 0:
                             self.patches.append((scene_idx, y, x))
+                            total_patches += 1
+                            if has_buildings:
+                                patches_with_buildings += 1
+            
+            print(f"\nPatches statistics for {split} split:")
+            print(f"Total patches: {total_patches}")
+            print(f"Patches with buildings: {patches_with_buildings} ({patches_with_buildings/total_patches*100:.2f}%)")
 
-        # For train/val split, randomly assign patches
+        # For train/val split
         if split != 'test':
             np.random.shuffle(self.patches)
             n_total = len(self.patches)
-            n_train = int(n_total * 0.8)  # 80% for training
+            n_train = int(n_total * 0.8)
             if split == 'train':
                 self.patches = self.patches[:n_train]
             else:  # val
-                self.patches = self.patches[n_train:]  # remaining 20% for validation
+                self.patches = self.patches[n_train:]
 
     def _read_rgb(self, scene_dir):
         r = self._read_tif(os.path.join(scene_dir, 'RED.tif'))
@@ -518,6 +612,7 @@ train_transform = A.Compose([
     ToTensorV2()
 ])
 
+batch_size = 64
 patch_size = 224
 stride = 32
 
@@ -550,8 +645,6 @@ test_dataset = SatelliteDataset(
     test_ratio=0.1,
     random_seed=SEED
 )
-
-batch_size = 64
 
 train_loader = DataLoader(
     dataset=train_dataset,
