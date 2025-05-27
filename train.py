@@ -164,6 +164,41 @@ class SatelliteDataset(Dataset):
         
         return densities
 
+    def _pad_patch(self, img, mask, y, x, patch_size):
+        """Pad patch with zeros if it extends beyond image boundaries.
+        
+        Args:
+            img (np.ndarray): Source image
+            mask (np.ndarray): Source mask
+            y (int): Y coordinate of patch top-left corner
+            x (int): X coordinate of patch top-left corner
+            patch_size (int): Size of the patch
+            
+        Returns:
+            tuple: (padded_img, padded_mask, is_valid)
+        """
+        h, w = img.shape[:2]
+        
+        # Calculate actual patch dimensions
+        actual_h = min(patch_size, h - y)
+        actual_w = min(patch_size, w - x)
+        
+        # Create empty patches
+        if len(img.shape) == 3:
+            padded_img = np.zeros((patch_size, patch_size, img.shape[2]), dtype=img.dtype)
+        else:
+            padded_img = np.zeros((patch_size, patch_size), dtype=img.dtype)
+        padded_mask = np.zeros((patch_size, patch_size), dtype=mask.dtype)
+        
+        # Copy actual data
+        padded_img[:actual_h, :actual_w] = img[y:y+actual_h, x:x+actual_w]
+        padded_mask[:actual_h, :actual_w] = mask[y:y+actual_h, x:x+actual_w]
+        
+        # Check if patch contains any buildings
+        has_buildings = np.any(padded_mask > 0)
+        
+        return padded_img, padded_mask, has_buildings
+
     def __init__(self, 
                  root_dirs, 
                  patch_size=512, 
@@ -215,12 +250,12 @@ class SatelliteDataset(Dataset):
             cell_size = ((min_cell_size + stride - 1) // stride) * stride
             
             # Вычисляем количество ячеек сетки
-            grid_h = max(2, (h - patch_size) // cell_size + 1)
-            grid_w = max(2, (w - patch_size) // cell_size + 1)
+            grid_h = max(2, (h - 1) // cell_size + 1)  # Changed to include partial cells
+            grid_w = max(2, (w - 1) // cell_size + 1)  # Changed to include partial cells
             
             # Корректируем размер ячейки
-            cell_h = (h - patch_size) // grid_h + 1
-            cell_w = (w - patch_size) // grid_w + 1
+            cell_h = (h - 1) // grid_h + 1  # Changed to include partial cells
+            cell_w = (w - 1) // grid_w + 1  # Changed to include partial cells
             cell_size_h = ((cell_h + stride - 1) // stride) * stride
             cell_size_w = ((cell_w + stride - 1) // stride) * stride
             
@@ -293,20 +328,21 @@ class SatelliteDataset(Dataset):
             patches_with_buildings = 0
             total_patches = 0
             
-            for y in range(0, h - self.patch_size + 1, self.stride):
-                for x in range(0, w - self.patch_size + 1, self.stride):
+            # Изменено: теперь проходим по всему изображению, включая края
+            for y in range(0, h, self.stride):
+                for x in range(0, w, self.stride):
+                    # Get padded patches to check for buildings
+                    _, _, has_buildings = self._pad_patch(img, mask, y, x, self.patch_size)
+                    
+                    # Calculate which cell this patch belongs to
                     patch_corners = [
                         (y // cell_size_h, x // cell_size_w),
-                        (y // cell_size_h, (x + patch_size - 1) // cell_size_w),
-                        ((y + patch_size - 1) // cell_size_h, x // cell_size_w),
-                        ((y + patch_size - 1) // cell_size_h, (x + patch_size - 1) // cell_size_w)
+                        (y // cell_size_h, min((x + patch_size - 1), w - 1) // cell_size_w),
+                        (min((y + patch_size - 1), h - 1) // cell_size_h, x // cell_size_w),
+                        (min((y + patch_size - 1), h - 1) // cell_size_h, min((x + patch_size - 1), w - 1) // cell_size_w)
                     ]
                     
                     corners_in_test = sum(1 for corner in patch_corners if corner in test_cells)
-                    
-                    # Проверяем наличие зданий в патче
-                    patch_mask = mask[y:y+patch_size, x:x+patch_size]
-                    has_buildings = np.any(patch_mask > 0)
                     
                     if split == 'test':
                         if corners_in_test == len(patch_corners):
@@ -360,8 +396,14 @@ class SatelliteDataset(Dataset):
 
     def __getitem__(self, idx):
         scene_idx, y, x = self.patches[idx]
-        img_patch = self.imgs[scene_idx][y:y+self.patch_size, x:x+self.patch_size, :]
-        mask_patch = self.masks[scene_idx][y:y+self.patch_size, x:x+self.patch_size]
+        
+        # Get padded patches
+        img_patch, mask_patch, _ = self._pad_patch(
+            self.imgs[scene_idx], 
+            self.masks[scene_idx],
+            y, x, 
+            self.patch_size
+        )
         
         if self.transform:
             augmented = self.transform(image=img_patch, mask=mask_patch)
