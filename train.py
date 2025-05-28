@@ -138,6 +138,7 @@ class SatelliteDataset(Dataset):
         transform (callable, optional): Transforms to apply to patches. Defaults to None.
         split (str, optional): Dataset split - 'train', 'val' or 'test'. Defaults to 'train'.
         test_ratio (float, optional): Ratio of data to use for test set. Defaults to 0.1.
+        val_ratio (float, optional): Ratio of data to use for validation set. Defaults to 0.2.
         random_seed (int, optional): Random seed for reproducibility. Defaults to 42.
     """
     def _calculate_cell_building_density(self, mask, cell_size_h, cell_size_w, grid_h, grid_w):
@@ -170,38 +171,115 @@ class SatelliteDataset(Dataset):
         
         return densities
 
-    def _assign_cells_to_splits(self, densities, test_ratio=0.1, val_ratio=0.1):
-        """Assign cells to train/val/test splits ensuring balanced building distribution."""
-        # Sort cells by density
+    def _assign_cells_to_splits(self, densities, test_ratio=0.15, val_ratio=0.2):
+        """Assign cells to splits ensuring balanced building distribution.
+        
+        Args:
+            densities (dict): Dictionary of cell densities and info
+            test_ratio (float): Ratio of cells to assign to test split
+            val_ratio (float): Ratio of cells to assign to validation split
+            
+        Returns:
+            dict: Dictionary with train, val, test cell assignments
+        """
         cells = list(densities.items())
-        cells.sort(key=lambda x: x[1]['density'], reverse=True)
+        cells.sort(key=lambda x: x[1]['density'])
         
-        # Calculate total building pixels
-        total_building_pixels = sum(info['building_pixels'] for _, info in cells)
-        target_test_pixels = total_building_pixels * test_ratio
+        n_cells = len(cells)
+        quintile_size = max(1, n_cells // 5)
+        quintiles = [cells[i:i + quintile_size] for i in range(0, n_cells, quintile_size)]
+        
+        # Вычисляем целевое количество пикселей зданий для каждого сплита
+        total_building_pixels = sum(cell[1]['building_pixels'] for cell in cells)
         target_val_pixels = total_building_pixels * val_ratio
+        target_test_pixels = total_building_pixels * test_ratio
         
-        # Initialize splits
-        splits = {
-            'test': [],
-            'val': [],
-            'train': []
-        }
-        current_test_pixels = 0
+        # Сортируем все ячейки по количеству пикселей зданий для более точного распределения
+        all_cells = []
+        for quintile in quintiles:
+            all_cells.extend(quintile)
+        
+        # Сортируем ячейки по плотности внутри каждого квинтиля
+        all_cells.sort(key=lambda x: (x[1]['density'], x[1]['building_pixels']))
+        
+        val_cells = []
+        test_cells = []
+        train_cells = []
+        
         current_val_pixels = 0
+        current_test_pixels = 0
         
-        # Assign cells to splits
-        for cell, info in cells:
-            if current_test_pixels < target_test_pixels:
-                splits['test'].append(cell)
-                current_test_pixels += info['building_pixels']
-            elif current_val_pixels < target_val_pixels:
-                splits['val'].append(cell)
-                current_val_pixels += info['building_pixels']
+        # Распределяем ячейки, обеспечивая точное соответствие целевым пропорциям
+        for cell in all_cells:
+            cell_pixels = cell[1]['building_pixels']
+            
+            # Проверяем, куда лучше добавить текущую ячейку
+            val_ratio_if_added = (current_val_pixels + cell_pixels) / total_building_pixels
+            test_ratio_if_added = (current_test_pixels + cell_pixels) / total_building_pixels
+            
+            val_diff = abs(val_ratio_if_added - val_ratio)
+            test_diff = abs(test_ratio_if_added - test_ratio)
+            current_val_diff = abs(current_val_pixels / total_building_pixels - val_ratio)
+            current_test_diff = abs(current_test_pixels / total_building_pixels - test_ratio)
+            
+            # Добавляем ячейку туда, где она минимизирует отклонение от целевых пропорций
+            if current_val_pixels / total_building_pixels < val_ratio and (val_diff < current_val_diff or len(val_cells) == 0):
+                val_cells.append(cell[0])
+                current_val_pixels += cell_pixels
+            elif current_test_pixels / total_building_pixels < test_ratio and (test_diff < current_test_diff or len(test_cells) == 0):
+                test_cells.append(cell[0])
+                current_test_pixels += cell_pixels
             else:
-                splits['train'].append(cell)
+                train_cells.append(cell[0])
         
-        return splits
+        # Проверяем и корректируем распределение если нужно
+        val_ratio_achieved = current_val_pixels / total_building_pixels
+        test_ratio_achieved = current_test_pixels / total_building_pixels
+        
+        print(f"\nSplit ratios (building pixels):")
+        print(f"Validation: target={val_ratio:.1%}, achieved={val_ratio_achieved:.1%}")
+        print(f"Test: target={test_ratio:.1%}, achieved={test_ratio_achieved:.1%}")
+        
+        return {
+            'train': train_cells,
+            'val': val_cells,
+            'test': test_cells
+        }
+
+    def check_split_balance(self, split_stats):
+        """Check if splits are balanced in terms of building density.
+        
+        Args:
+            split_stats (dict): Dictionary containing statistics for each split
+            
+        Returns:
+            bool: True if splits are balanced, False otherwise
+        """
+        densities = {split: stats['building_pixels'] / stats['total_pixels'] 
+                    for split, stats in split_stats.items()}
+        
+        # Максимальное допустимое отклонение плотности между сплитами
+        max_density_diff = 0.05  # 5%
+        
+        mean_density = sum(densities.values()) / len(densities)
+        is_balanced = all(abs(d - mean_density) <= max_density_diff 
+                         for d in densities.values())
+        
+        if not is_balanced:
+            print("\nWarning: Splits are not balanced!")
+            print("Building densities:")
+            for split, density in densities.items():
+                print(f"  {split}: {density*100:.2f}%")
+            print(f"  Mean density: {mean_density*100:.2f}%")
+            print(f"  Max allowed difference: {max_density_diff*100:.1f}%")
+        else:
+            print("\nSplits are well balanced!")
+            print("Building densities:")
+            for split, density in densities.items():
+                print(f"  {split}: {density*100:.2f}%")
+            print(f"  Mean density: {mean_density*100:.2f}%")
+        
+        return is_balanced
 
     def _generate_patches_for_cell(self, cell_bounds, stride):
         """Generate patch coordinates within a cell."""
@@ -221,7 +299,8 @@ class SatelliteDataset(Dataset):
                  stride=512, 
                  transform=None, 
                  split='train', 
-                 test_ratio=0.1, 
+                 test_ratio=0.15,
+                 val_ratio=0.2,
                  random_seed=42):
         if isinstance(root_dirs, str):
             root_dirs = [root_dirs]
@@ -231,6 +310,7 @@ class SatelliteDataset(Dataset):
         self.transform = transform
         self.split = split
         self.test_ratio = test_ratio
+        self.val_ratio = val_ratio
         self.random_seed = random_seed
 
         # Set random seed for reproducibility
@@ -241,7 +321,8 @@ class SatelliteDataset(Dataset):
         self.masks = []
         self.padded_imgs = []
         self.padded_masks = []
-        self.padding_info = []  # Store padding information for each scene
+        self.valid_masks = []  # Add valid mask to track real vs padded areas
+        self.padding_info = []
         
         for scene_dir in self.root_dirs:
             img = self._read_rgb(scene_dir)
@@ -251,41 +332,48 @@ class SatelliteDataset(Dataset):
             h, w = img.shape[:2]
             cell_size = 2 * patch_size
             
+            # Create valid mask for original image
+            valid_mask = np.ones((h, w), dtype=bool)
+            
             # First add padding for edge handling (half patch_size on each side)
             pad_size = patch_size // 2
             edge_padded_h = h + 2 * pad_size
             edge_padded_w = w + 2 * pad_size
             
-            # Create edge padded versions
-            edge_padded_img = np.zeros((edge_padded_h, edge_padded_w, 3), dtype=img.dtype)
-            edge_padded_mask = np.zeros((edge_padded_h, edge_padded_w), dtype=mask.dtype)
-            
-            # Copy original content to the center
-            edge_padded_img[pad_size:pad_size+h, pad_size:pad_size+w] = img
-            edge_padded_mask[pad_size:pad_size+h, pad_size:pad_size+w] = mask
+            # Use reflection padding for images and masks
+            edge_padded_img = np.pad(img, ((pad_size, pad_size), (pad_size, pad_size), (0, 0)), mode='reflect')
+            edge_padded_mask = np.pad(mask, ((pad_size, pad_size), (pad_size, pad_size)), mode='reflect')
+            edge_padded_valid = np.pad(valid_mask, ((pad_size, pad_size), (pad_size, pad_size)), mode='constant', constant_values=0)
             
             # Then extend to make dimensions divisible by cell_size
             final_h = ((edge_padded_h + cell_size - 1) // cell_size) * cell_size
             final_w = ((edge_padded_w + cell_size - 1) // cell_size) * cell_size
             
-            # Calculate additional padding needed for cell_size divisibility
+            # Calculate additional padding needed
             extra_pad_h = final_h - edge_padded_h
             extra_pad_w = final_w - edge_padded_w
-            
-            # Create final padded versions
-            padded_img = np.zeros((final_h, final_w, 3), dtype=img.dtype)
-            padded_mask = np.zeros((final_h, final_w), dtype=mask.dtype)
-            
-            # Copy edge padded content (centered in final padding)
             extra_top = extra_pad_h // 2
+            extra_bottom = extra_pad_h - extra_top
             extra_left = extra_pad_w // 2
-            padded_img[extra_top:extra_top+edge_padded_h, extra_left:extra_left+edge_padded_w] = edge_padded_img
-            padded_mask[extra_top:extra_top+edge_padded_h, extra_left:extra_left+edge_padded_w] = edge_padded_mask
+            extra_right = extra_pad_w - extra_left
+            
+            # Apply final padding using reflection for image and mask
+            padded_img = np.pad(edge_padded_img, 
+                              ((extra_top, extra_bottom), (extra_left, extra_right), (0, 0)),
+                              mode='reflect')
+            padded_mask = np.pad(edge_padded_mask,
+                               ((extra_top, extra_bottom), (extra_left, extra_right)),
+                               mode='reflect')
+            padded_valid = np.pad(edge_padded_valid,
+                                ((extra_top, extra_bottom), (extra_left, extra_right)),
+                                mode='constant',
+                                constant_values=0)
             
             self.imgs.append(img)
             self.masks.append(mask)
             self.padded_imgs.append(padded_img)
             self.padded_masks.append(padded_mask)
+            self.valid_masks.append(padded_valid)
             self.padding_info.append({
                 'original_h': h,
                 'original_w': w,
@@ -297,12 +385,12 @@ class SatelliteDataset(Dataset):
                 'final_h': final_h,
                 'final_w': final_w
             })
-
+            
         # Initialize patches list
         self.patches = []  # (scene_idx, y, x)
         
         # Process each scene
-        for scene_idx, (padded_img, padded_mask, padding) in enumerate(zip(self.padded_imgs, self.padded_masks, self.padding_info)):
+        for scene_idx, (padded_img, padded_mask, padded_valid, padding) in enumerate(zip(self.padded_imgs, self.padded_masks, self.valid_masks, self.padding_info)):
             # Calculate grid dimensions
             grid_h = padding['final_h'] // cell_size
             grid_w = padding['final_w'] // cell_size
@@ -321,27 +409,28 @@ class SatelliteDataset(Dataset):
                     x_start = j * cell_size
                     x_end = (j + 1) * cell_size
                     
-                    # Convert to original image coordinates for density calculation
-                    orig_y_start = max(0, min(padding['original_h'], y_start - total_top_offset))
-                    orig_y_end = max(0, min(padding['original_h'], y_end - total_top_offset))
-                    orig_x_start = max(0, min(padding['original_w'], x_start - total_left_offset))
-                    orig_x_end = max(0, min(padding['original_w'], x_end - total_left_offset))
+                    # Get cell regions
+                    cell_mask = padded_mask[y_start:y_end, x_start:x_end]
+                    cell_valid = padded_valid[y_start:y_end, x_start:x_end]
                     
-                    # Calculate density using original image coordinates
-                    cell_mask = self.masks[scene_idx][orig_y_start:orig_y_end, orig_x_start:orig_x_end]
-                    building_pixels = np.sum(cell_mask > 0)
-                    total_pixels = cell_mask.size
-                    density = building_pixels / total_pixels if total_pixels > 0 else 0
+                    # Calculate density using only valid pixels
+                    valid_pixels = cell_valid.sum()
+                    if valid_pixels > 0:
+                        building_pixels = np.sum((cell_mask > 0) & cell_valid)
+                        density = building_pixels / valid_pixels
+                    else:
+                        building_pixels = 0
+                        density = 0
                     
                     densities[(i, j)] = {
                         'density': density,
                         'building_pixels': building_pixels,
-                        'total_pixels': total_pixels,
-                        'bounds': (y_start, y_end, x_start, x_end)  # Store padded coordinates
+                        'total_pixels': valid_pixels,
+                        'bounds': (y_start, y_end, x_start, x_end)
                     }
             
             # Assign cells to splits
-            cell_splits = self._assign_cells_to_splits(densities, self.test_ratio, self.test_ratio)
+            cell_splits = self._assign_cells_to_splits(densities, self.test_ratio, self.val_ratio)
             
             # Generate patches for the current split
             if self.split in cell_splits:
@@ -351,8 +440,10 @@ class SatelliteDataset(Dataset):
                     # Generate patches with stride
                     for y in range(y_start, y_end - patch_size + 1, stride):
                         for x in range(x_start, x_end - patch_size + 1, stride):
-                            # Store padded coordinates
-                            self.patches.append((scene_idx, y, x))
+                            # Check if patch contains any valid pixels
+                            patch_valid = padded_valid[y:y+patch_size, x:x+patch_size]
+                            if patch_valid.sum() > 0:  # Only add patch if it contains valid pixels
+                                self.patches.append((scene_idx, y, x))
 
             print(f"\nScene {scene_idx} Statistics:")
             print(f"Original size: {padding['original_h']}x{padding['original_w']}")
@@ -403,6 +494,7 @@ class SatelliteDataset(Dataset):
         # Get patches from padded images
         img_patch = self.padded_imgs[scene_idx][y:y+self.patch_size, x:x+self.patch_size]
         mask_patch = self.padded_masks[scene_idx][y:y+self.patch_size, x:x+self.patch_size]
+        valid_patch = self.valid_masks[scene_idx][y:y+self.patch_size, x:x+self.patch_size]
         
         if self.transform:
             augmented = self.transform(image=img_patch, mask=mask_patch)
@@ -416,7 +508,9 @@ class SatelliteDataset(Dataset):
             mask_patch = torch.from_numpy(mask_patch).long()
             mask_patch = mask_patch.unsqueeze(0)
         
-        return {'img': img_patch, 'mask': mask_patch, 'coords': (scene_idx, y, x)}
+        valid_patch = torch.from_numpy(valid_patch).bool().unsqueeze(0)
+        
+        return {'img': img_patch, 'mask': mask_patch, 'valid': valid_patch, 'coords': (scene_idx, y, x)}
 
     def visualize_split(self, scene_idx=0):
         """Visualize dataset split for a given scene."""
@@ -488,7 +582,7 @@ class SatelliteDataset(Dataset):
                 }
         
         # Assign cells to splits
-        cell_splits = self._assign_cells_to_splits(densities, self.test_ratio, self.test_ratio)
+        cell_splits = self._assign_cells_to_splits(densities, self.test_ratio, self.val_ratio)
         
         # Draw patches for each split
         for split_name, cells in cell_splits.items():
@@ -511,8 +605,8 @@ class SatelliteDataset(Dataset):
         # Add legend
         legend_elements = [
             plt.Rectangle((0, 0), 1, 1, facecolor='none', edgecolor='blue', linewidth=1, label='Train'),
-            plt.Rectangle((0, 0), 1, 1, facecolor='none', edgecolor='red', linewidth=2, label='Val'),
-            plt.Rectangle((0, 0), 1, 1, facecolor='none', edgecolor='yellow', linewidth=3, label='Test')
+            plt.Rectangle((0, 0), 1, 1, facecolor='none', edgecolor='red', linewidth=1, label='Val'),
+            plt.Rectangle((0, 0), 1, 1, facecolor='none', edgecolor='yellow', linewidth=1, label='Test')
         ]
         plt.legend(handles=legend_elements, loc='upper right')
         plt.axis('off')
@@ -555,6 +649,103 @@ class SatelliteDataset(Dataset):
             print(f"  Cells: {len(cells)}")
             print(f"  Building pixels: {total_building_pixels}")
             print(f"  Building density: {density*100:.1f}%")
+
+    def analyze_splits(self):
+        """Analyze data distribution in splits."""
+        # Initialize counters for each split
+        split_stats = {
+            'train': {'patches': 0, 'building_pixels': 0, 'total_pixels': 0, 'cells': 0},
+            'val': {'patches': 0, 'building_pixels': 0, 'total_pixels': 0, 'cells': 0},
+            'test': {'patches': 0, 'building_pixels': 0, 'total_pixels': 0, 'cells': 0}
+        }
+        
+        # Process each scene
+        for scene_idx, (padded_img, padded_mask, padding) in enumerate(zip(self.padded_imgs, self.padded_masks, self.padding_info)):
+            cell_size = 2 * self.patch_size
+            grid_h = padding['final_h'] // cell_size
+            grid_w = padding['final_w'] // cell_size
+            
+            # Total offset from original image coordinates
+            total_top_offset = padding['pad_size'] + padding['extra_top']
+            total_left_offset = padding['pad_size'] + padding['extra_left']
+            
+            # Calculate densities and assign cells to splits
+            densities = {}
+            for i in range(grid_h):
+                for j in range(grid_w):
+                    # Define cell boundaries in padded coordinates
+                    y_start = i * cell_size
+                    y_end = (i + 1) * cell_size
+                    x_start = j * cell_size
+                    x_end = (j + 1) * cell_size
+                    
+                    # Convert to original image coordinates for density calculation
+                    orig_y_start = max(0, min(padding['original_h'], y_start - total_top_offset))
+                    orig_y_end = max(0, min(padding['original_h'], y_end - total_top_offset))
+                    orig_x_start = max(0, min(padding['original_w'], x_start - total_left_offset))
+                    orig_x_end = max(0, min(padding['original_w'], x_end - total_left_offset))
+                    
+                    # Calculate density using original image coordinates
+                    cell_mask = self.masks[scene_idx][orig_y_start:orig_y_end, orig_x_start:orig_x_end]
+                    building_pixels = np.sum(cell_mask > 0)
+                    total_pixels = cell_mask.size
+                    density = building_pixels / total_pixels if total_pixels > 0 else 0
+                    
+                    densities[(i, j)] = {
+                        'density': density,
+                        'building_pixels': building_pixels,
+                        'total_pixels': total_pixels,
+                        'bounds': (y_start, y_end, x_start, x_end)
+                    }
+            
+            # Assign cells to splits
+            cell_splits = self._assign_cells_to_splits(densities, self.test_ratio, self.val_ratio)
+            
+            # Count patches and pixels for each split
+            for split_name, cells in cell_splits.items():
+                split_stats[split_name]['cells'] += len(cells)
+                
+                # Calculate total pixels and building pixels
+                building_pixels = sum(densities[cell]['building_pixels'] for cell in cells)
+                total_pixels = sum(densities[cell]['total_pixels'] for cell in cells)
+                split_stats[split_name]['building_pixels'] += building_pixels
+                split_stats[split_name]['total_pixels'] += total_pixels
+                
+                # Count patches for all splits
+                for cell in cells:
+                    y_start, y_end, x_start, x_end = densities[cell]['bounds']
+                    patch_count = ((y_end - y_start - self.patch_size) // self.stride + 1) * \
+                                ((x_end - x_start - self.patch_size) // self.stride + 1)
+                    split_stats[split_name]['patches'] += patch_count
+        
+        # Print analysis
+        print("\nData Distribution Analysis:")
+        print("-" * 50)
+        for split_name, stats in split_stats.items():
+            density = stats['building_pixels'] / stats['total_pixels'] * 100 if stats['total_pixels'] > 0 else 0
+            print(f"\n{split_name.capitalize()}:")
+            print(f"  Cells: {stats['cells']}")
+            print(f"  Patches: {stats['patches']}")
+            print(f"  Building density: {density:.2f}%")
+            print(f"  Building pixels: {stats['building_pixels']:,}")
+            print(f"  Total pixels: {stats['total_pixels']:,}")
+        
+        # Calculate and print ratios
+        total_patches = sum(s['patches'] for s in split_stats.values())
+        total_pixels = sum(s['total_pixels'] for s in split_stats.values())
+        total_building_pixels = sum(s['building_pixels'] for s in split_stats.values())
+        
+        print("\nSplit Ratios:")
+        print("-" * 50)
+        for split_name, stats in split_stats.items():
+            patch_ratio = stats['patches'] / total_patches * 100 if total_patches > 0 else 0
+            pixel_ratio = stats['building_pixels'] / total_building_pixels * 100
+            print(f"{split_name.capitalize()}:")
+            print(f"  Patch ratio: {patch_ratio:.2f}%")
+            print(f"  Building pixel ratio: {pixel_ratio:.2f}%")
+            
+        # Check split balance
+        self.check_split_balance(split_stats)
 
 ########################################################
 # LOSS
@@ -668,12 +859,6 @@ class ComboLoss(torch.nn.Module):
         dice_weight (float, optional): Weight for Dice loss term. Defaults to 0.6.
         bce_weight (float, optional): Weight for BCE loss term. Defaults to 0.3.
         boundary_weight (float, optional): Weight for boundary loss term. Defaults to 0.2.
-
-    Attributes:
-        dice_weight (float): Weight for Dice loss term
-        bce_weight (float): Weight for BCE loss term
-        boundary_weight (float): Weight for boundary loss term
-        boundary_loss (ConditionalBoundaryLoss): Boundary loss function instance
     """
 
     def __init__(self, dice_weight=0.6, bce_weight=0.3, boundary_weight=0.2):
@@ -698,10 +883,13 @@ class ComboLoss(torch.nn.Module):
         # Убедимся, что у targets есть размерность каналов
         if targets.ndim == 3:
             targets = targets.unsqueeze(1)
+            
         loss = self.dice_weight * self.dice(outputs, targets) + \
                self.bce_weight * self.bce(outputs, targets.float())
+        
         if self.boundary_weight > 0:
             loss += self.boundary_weight * self.boundary(outputs, targets)
+            
         return loss
 
 
@@ -782,11 +970,10 @@ train_transform = A.Compose([
     A.VerticalFlip(p=0.5),
     A.RandomBrightnessContrast(p=0.3),
     A.ShiftScaleRotate(shift_limit=0.1, scale_limit=0.15, rotate_limit=30, p=0.4),
-    A.CLAHE(p=0.15),
-    A.OneOf([
-        A.GaussNoise(var_limit=(10.0, 50.0), p=0.5),
-        A.GaussianBlur(blur_limit=(3, 5), p=0.5),
-    ], p=0.15),
+    # A.OneOf([
+    #     A.GaussNoise(var_limit=(10.0, 50.0), p=0.5),
+    #     A.GaussianBlur(blur_limit=(3, 5), p=0.5),
+    # ], p=0.15),
     A.Normalize(mean=MEAN, std=STD),
     ToTensorV2()
 ])
@@ -801,9 +988,12 @@ train_dataset = SatelliteDataset(
     stride=stride,
     transform=train_transform,
     split='train',
-    test_ratio=0.1,
+    test_ratio=0.15,
+    val_ratio=0.2,
     random_seed=SEED
 )
+print("\nAnalyzing training dataset:")
+train_dataset.analyze_splits()
 
 val_dataset = SatelliteDataset(
     root_dirs=data_dirs,
@@ -811,9 +1001,12 @@ val_dataset = SatelliteDataset(
     stride=stride,
     transform=val_transform, 
     split='val',
-    test_ratio=0.1,
+    test_ratio=0.15,
+    val_ratio=0.2,
     random_seed=SEED
 )
+print("\nAnalyzing validation dataset:")
+val_dataset.analyze_splits()
 
 test_dataset = SatelliteDataset(
     root_dirs=data_dirs,
@@ -821,9 +1014,12 @@ test_dataset = SatelliteDataset(
     stride=stride,
     transform=val_transform,
     split='test',
-    test_ratio=0.1,
+    test_ratio=0.15,
+    val_ratio=0.2,
     random_seed=SEED
 )
+print("\nAnalyzing test dataset:")
+test_dataset.analyze_splits()
 
 train_loader = DataLoader(
     dataset=train_dataset,
@@ -875,10 +1071,11 @@ for scene_idx in range(len(train_dataset.root_dirs)):
 
 # Функция для визуализации батча
 def visualize_batch(loader, title):
-    """Visualize a batch of training data.
+    """Visualize a batch of training data and calculate dataset statistics.
 
     This function displays a grid of images and their corresponding masks
-    from a single batch of the data loader.
+    from a single batch of the data loader, and calculates statistics
+    across multiple batches for better representation.
 
     Args:
         loader (DataLoader): DataLoader containing the dataset
@@ -887,35 +1084,35 @@ def visualize_batch(loader, title):
     Returns:
         None
     """
-    # Получаем один батч
+    # Get first batch for visualization
     iterator = iter(loader)
     batch = next(iterator)
     
-    # Распаковываем батч
+    # Unpack batch
     images = batch['img']
     masks = batch['mask']
     coords = batch['coords']
     scene_idx_tensor, y_tensor, x_tensor = coords
     
-    # Отрисовка батча
+    # Plot batch
     fig, axes = plt.subplots(min(batch_size, len(images)), 2, figsize=(10, min(batch_size, len(images)) * 5))
     if batch_size == 1:
         axes = axes.reshape(1, -1)
     
     for i in range(min(batch_size, len(images))):
-        # Денормализуем изображение
+        # Denormalize image
         img = denormalize(images[i]).permute(1, 2, 0).cpu().numpy()
         img = np.clip(img, 0, 1)
         
-        # Маска - убираем лишние размерности и переводим в numpy
+        # Mask
         mask = masks[i].squeeze().cpu().numpy()
         
-        # Координаты
+        # Coordinates
         scene_idx = scene_idx_tensor[i].item()
         y_coord = y_tensor[i].item()
         x_coord = x_tensor[i].item()
         
-        # Отрисовка
+        # Plot
         axes[i, 0].imshow(img)
         axes[i, 0].set_title(f"Image {i+1}, Scene: {scene_idx}, (y={y_coord}, x={x_coord})")
         axes[i, 0].axis('off')
@@ -928,12 +1125,27 @@ def visualize_batch(loader, title):
     plt.tight_layout()
     plt.show()
     
-    building_pixels = (masks == 1).sum().item()
-    total_pixels = masks.numel()
-    building_percent = building_pixels / total_pixels * 100
+    # Calculate statistics across multiple batches
+    print(f"\nCalculating statistics for {title}...")
+    total_building_pixels = 0
+    total_pixels = 0
+    num_batches_to_analyze = min(10, len(loader))
+    
+    iterator = iter(loader)
+    for i in range(num_batches_to_analyze):
+        try:
+            batch = next(iterator)
+            masks = batch['mask']
+            building_pixels = (masks == 1).sum().item()
+            total_pixels += masks.numel()
+            total_building_pixels += building_pixels
+        except StopIteration:
+            break
+    
+    building_percent = total_building_pixels / total_pixels * 100 if total_pixels > 0 else 0
     print(f"{title} - Dataset size: {len(loader.dataset)}")
-    print(f"{title} - Building pixels: {building_pixels} ({building_percent:.2f}%)")
-    print(f"{title} - Background pixels: {total_pixels - building_pixels} ({100 - building_percent:.2f}%)")
+    print(f"{title} - Building pixels: {total_building_pixels:,} ({building_percent:.2f}%)")
+    print(f"{title} - Background pixels: {total_pixels - total_building_pixels:,} ({100 - building_percent:.2f}%)")
 
 # Визуализация данных из всех сплитов
 print("\nDataset statistics:")
@@ -1140,13 +1352,13 @@ def validate(model, loader, criterion, metrics, device, writer, epoch):
     recall = np.r_[0., recall, 1.]
     precision = np.r_[1., precision, 0.]
     
-    # Интерполяция precision для монотонности (step interpolation)
+    # Интерполяция precision для монотонности
     decreasing_max = np.maximum.accumulate(precision[::-1])[::-1]
     precision = decreasing_max
     
     # Вычисляем AUC для ROC и PR кривых
     roc_auc = auc(fpr, tpr)
-    pr_auc = auc(recall, precision)  # Используем auc для PR кривой после интерполяции
+    pr_auc = auc(recall, precision)
     
     # Создаем и логируем ROC кривую
     fig_roc = plt.figure(figsize=(8, 6))
